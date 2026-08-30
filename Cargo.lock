@@ -1265,12 +1265,12 @@ name = "strajer-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "hex",
  "reqwest",
  "serde",
  "serde_json",
  "strajer-lan",
  "strajer-protocol",
+ "strajer-w3gs",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1310,6 +1310,14 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "strajer-w3gs"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

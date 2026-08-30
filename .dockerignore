@@ -2,6 +2,8 @@
 .gitignore
 .DS_Store
 target
+dist
+maps
 *.log
 .env
 .env.*

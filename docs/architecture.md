@@ -26,17 +26,29 @@ Contractele serializabile dintre server și agent. Nu conține detalii Axum, DNS
 
 Codifică recordul LAN Reforged și îl publică prin DNS-SD pe macOS. Portul publicat aparține listener-ului local al agentului, nu serverului Linux.
 
+### `strajer-w3gs`
+
+Implementează framing-ul binar W3GS și decodoarele tipizate, independent de
+transport, server și UI. Reader-ul validează signature, lungime și limita
+configurată înainte de orice alocare bazată pe input.
+
 ### `strajer-server`
 
 Control-plane Linux. În primul slice păstrează un lobby sintetic immutable în memorie. Ulterior va deține registry-ul, autentificarea, actorii W3GS și persistența.
 
 ### `strajer-agent`
 
-Procesul de networking inclus și supravegheat de `Strajer.app`. Descarcă lobby-urile, deschide listener-ele locale și publică recordurile LAN. Toate conexiunile către server sunt inițiate outbound.
+Procesul de networking inclus și supravegheat de `Strajer.app`. Descarcă
+lobby-urile, deschide listener-ele locale, publică recordurile LAN și validează
+primul `REQJOIN` încadrat de `strajer-w3gs`. Toate conexiunile către server sunt
+inițiate outbound.
 
 ### `Strajer.app`
 
-Shell SwiftUI `MenuBarExtra`, fără Dock icon. Pornește agentul inclus, consumă evenimentele JSON de status, îl repornește după failure și afișează starea plus numărul de jocuri. Endpoint-ul este inclus în `Info.plist` la build; utilizatorul nu are configurări.
+Shell SwiftUI `MenuBarExtra`, fără Dock icon. Pornește agentul inclus, consumă
+evenimentele JSON de status, îl repornește după failure și afișează starea,
+numărul de jocuri și detectarea unui `REQJOIN` valid. Endpoint-ul este inclus în
+`Info.plist` la build; utilizatorul nu are configurări.
 
 ## Fluxul discovery
 

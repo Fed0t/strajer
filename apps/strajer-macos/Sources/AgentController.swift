@@ -31,11 +31,13 @@ enum AgentStatus: Equatable {
 
 private struct AgentStatusEvent: Decodable {
     let event: String
-    let lobbyCount: Int
+    let lobbyCount: Int?
+    let lobbyID: String?
 
     private enum CodingKeys: String, CodingKey {
         case event
         case lobbyCount = "lobby_count"
+        case lobbyID = "lobby_id"
     }
 }
 
@@ -43,6 +45,7 @@ private struct AgentStatusEvent: Decodable {
 final class AgentController: ObservableObject {
     @Published private(set) var status: AgentStatus = .connecting
     @Published private(set) var availableGames = 0
+    @Published private(set) var joinRequestCaptured = false
     @Published private(set) var lastError: String?
 
     private var process: Process?
@@ -80,6 +83,7 @@ final class AgentController: ObservableObject {
         restartImmediately = true
         status = .connecting
         availableGames = 0
+        joinRequestCaptured = false
         lastError = nil
         process.terminate()
     }
@@ -99,6 +103,7 @@ final class AgentController: ObservableObject {
     private func launchAgent() {
         status = .connecting
         availableGames = 0
+        joinRequestCaptured = false
         lastError = nil
         standardOutputBuffer.removeAll(keepingCapacity: true)
         standardErrorBuffer.removeAll(keepingCapacity: true)
@@ -215,14 +220,26 @@ final class AgentController: ObservableObject {
     }
 
     private func consumeStatusLine(_ lineData: Data) {
-        guard let event = try? JSONDecoder().decode(AgentStatusEvent.self, from: lineData),
-              event.event == "ready" else {
+        guard let event = try? JSONDecoder().decode(AgentStatusEvent.self, from: lineData) else {
             return
         }
 
-        status = .connected
-        availableGames = event.lobbyCount
-        lastError = nil
+        switch event.event {
+        case "ready":
+            guard let lobbyCount = event.lobbyCount else {
+                return
+            }
+            status = .connected
+            availableGames = lobbyCount
+            lastError = nil
+        case "join_request_captured":
+            guard event.lobbyID != nil else {
+                return
+            }
+            joinRequestCaptured = true
+        default:
+            return
+        }
     }
 
     private func consumeStandardError(_ data: Data) {
@@ -279,6 +296,7 @@ final class AgentController: ObservableObject {
     private func markUnavailable(_ message: String) {
         status = .unavailable
         availableGames = 0
+        joinRequestCaptured = false
         lastError = message
     }
 

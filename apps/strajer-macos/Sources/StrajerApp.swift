@@ -50,6 +50,10 @@ private struct StrajerMenuView: View {
 
         if controller.status == .connected {
             Text(gameCountLabel)
+
+            if controller.joinRequestCaptured {
+                Text("Join request detected")
+            }
         }
 
         if let lastError = controller.lastError, controller.status == .unavailable {

@@ -4,6 +4,7 @@ members = [
     "apps/strajer-server",
     "crates/strajer-lan",
     "crates/strajer-protocol",
+    "crates/strajer-w3gs",
 ]
 resolver = "3"
 

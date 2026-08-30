@@ -90,6 +90,17 @@ mod tests {
         assert_eq!(catalog.generated_at_unix_ms, 2_000);
         assert_eq!(catalog.lobbies.len(), 1);
         assert_eq!(catalog.lobbies[0].name, "Strajer Test #1");
+        assert_eq!(
+            catalog.lobbies[0].map.path,
+            "Maps\\Download\\DotA_v6_89Q.w3x"
+        );
+        assert_eq!(
+            catalog.lobbies[0].map.sha1_hex,
+            "c771ac8d7dc3665a211c2b1432672d49bfba1bcf"
+        );
+        assert_eq!(catalog.lobbies[0].map.checksum, 448_311_427);
+        assert_eq!(catalog.lobbies[0].map.width, 128);
+        assert_eq!(catalog.lobbies[0].map.height, 128);
         assert_eq!(catalog.validate(), Ok(()));
     }
 

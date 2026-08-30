@@ -7,6 +7,7 @@ use reqwest::Client;
 use serde::Serialize;
 use strajer_lan::PublishedLobby;
 use strajer_protocol::{LobbyCatalog, LobbyDescriptor};
+use strajer_w3gs::{FrameReader, ReqJoin};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -16,20 +17,32 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:18080";
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(5);
-const JOIN_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_JOIN_PROBE_BYTES: usize = 4_096;
+const JOIN_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_INITIAL_JOIN_FRAME_BYTES: usize = 4_096;
 
 #[derive(Debug, Serialize)]
 struct AgentStatusEvent {
     event: &'static str,
-    lobby_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lobby_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lobby_id: Option<String>,
 }
 
 impl AgentStatusEvent {
     fn ready(lobby_count: usize) -> Self {
         Self {
             event: "ready",
-            lobby_count,
+            lobby_count: Some(lobby_count),
+            lobby_id: None,
+        }
+    }
+
+    fn join_request_captured(lobby_id: &str) -> Self {
+        Self {
+            event: "join_request_captured",
+            lobby_count: None,
+            lobby_id: Some(lobby_id.to_owned()),
         }
     }
 }
@@ -119,43 +132,64 @@ async fn activate_lobby(
 }
 
 async fn accept_connections(lobby_id: String, listener: TcpListener) -> Result<()> {
+    let frame_reader = FrameReader::new(MAX_INITIAL_JOIN_FRAME_BYTES)
+        .context("invalid initial W3GS frame limit")?;
+
     loop {
-        let (stream, peer_address) = listener
+        let (stream, _) = listener
             .accept()
             .await
             .with_context(|| format!("listener failed for lobby {lobby_id}"))?;
         let connection_lobby_id = lobby_id.clone();
         tokio::spawn(probe_join_connection(
             connection_lobby_id,
-            peer_address.to_string(),
+            frame_reader,
             stream,
         ));
     }
 }
 
-async fn probe_join_connection(lobby_id: String, peer_address: String, mut stream: TcpStream) {
-    let mut buffer = vec![0_u8; MAX_JOIN_PROBE_BYTES];
-    let read_result = timeout(JOIN_PROBE_TIMEOUT, stream.read(&mut buffer)).await;
+async fn probe_join_connection(lobby_id: String, frame_reader: FrameReader, mut stream: TcpStream) {
+    let read_result = timeout(JOIN_FRAME_TIMEOUT, frame_reader.read_next(&mut stream)).await;
 
     match read_result {
-        Ok(Ok(bytes_read)) if bytes_read > 0 => {
-            info!(
-                %lobby_id,
-                %peer_address,
-                bytes_read,
-                packet_prefix = %hex::encode(&buffer[..bytes_read.min(64)]),
-                "captured initial Warcraft join packet"
-            );
-            warn!(%lobby_id, "W3GS join forwarding is not implemented in milestone M0");
-        }
-        Ok(Ok(_)) => {
-            info!(%lobby_id, %peer_address, "Warcraft closed the join connection");
+        Ok(Ok(Some(frame))) => match ReqJoin::decode(&frame) {
+            Ok(req_join) => {
+                info!(
+                    %lobby_id,
+                    frame_length = frame.encoded_length(),
+                    host_counter = req_join.host_counter(),
+                    listen_port = req_join.listen_port(),
+                    join_counter = req_join.join_counter(),
+                    player_name_bytes = req_join.player_name_bytes().len(),
+                    tail_bytes = req_join.tail().len(),
+                    "captured valid W3GS_REQJOIN"
+                );
+                if let Err(error) =
+                    emit_status_event(&AgentStatusEvent::join_request_captured(&lobby_id))
+                {
+                    warn!(%lobby_id, %error, "could not emit join capture status");
+                }
+                warn!(%lobby_id, "W3GS join forwarding is not implemented in milestone M0");
+            }
+            Err(error) => {
+                warn!(
+                    %lobby_id,
+                    packet_id = format_args!("0x{:02X}", frame.packet_id()),
+                    frame_length = frame.encoded_length(),
+                    %error,
+                    "rejected initial Warcraft W3GS frame"
+                );
+            }
+        },
+        Ok(Ok(None)) => {
+            info!(%lobby_id, "Warcraft closed the join connection");
         }
         Ok(Err(error)) => {
-            warn!(%lobby_id, %peer_address, %error, "could not read Warcraft join packet");
+            warn!(%lobby_id, %error, "could not read initial Warcraft W3GS frame");
         }
         Err(_) => {
-            warn!(%lobby_id, %peer_address, "Warcraft join probe timed out");
+            warn!(%lobby_id, "Warcraft W3GS join frame timed out");
         }
     }
 }
@@ -232,6 +266,21 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).expect("status should be UTF-8"),
             "{\"event\":\"ready\",\"lobby_count\":3}\n"
+        );
+    }
+
+    #[test]
+    fn writes_a_non_sensitive_join_capture_status() {
+        let mut output = Vec::new();
+        write_status_event(
+            &mut output,
+            &AgentStatusEvent::join_request_captured("synthetic-1"),
+        )
+        .expect("status should serialize");
+
+        assert_eq!(
+            String::from_utf8(output).expect("status should be UTF-8"),
+            "{\"event\":\"join_request_captured\",\"lobby_id\":\"synthetic-1\"}\n"
         );
     }
 }

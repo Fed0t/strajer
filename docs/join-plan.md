@@ -24,12 +24,25 @@ Milestone-ul M1 acoperă primul prag. M2 acoperă al doilea.
   același LAN nu mai concurează pentru același service instance.
 - Warcraft inițiază o conexiune TCP către portul din recordul LAN atunci când
   utilizatorul apasă `Join`.
-- Agentul poate captura primul payload TCP, dar încă nu implementează framing
-  W3GS sau forwarding.
+- Agentul citește incremental primul frame W3GS și validează prefixul tipizat
+  `REQJOIN`; forwarding-ul nu este încă implementat.
 - Serverul actual expune numai catalogul HTTP și endpoint-urile de health.
 
-Descriptorul `Synthetic.w3x` este suficient doar pentru discovery. Un join real
-necesită o hartă existentă, metadata reală și răspunsuri W3GS valide.
+Catalogul publică acum harta reală `DotA_v6_89Q.w3x`; un join complet mai
+necesită răspunsurile W3GS valide ale host engine-ului.
+
+Manifestul verificat local la 30 august 2026 este:
+
+- cale W3GS: `Maps\Download\DotA_v6_89Q.w3x`;
+- dimensiune fișier: `35.053.979` bytes;
+- SHA-1 brut al arhivei, folosit drept `map_sha1`: `c771ac8d7dc3665a211c2b1432672d49bfba1bcf`;
+- CRC32 brut al arhivei, necesar ulterior în `MAPCHECK`: `2194498669`;
+- checksum Xoro al conținutului MPQ: `448311427`;
+- dimensiuni hartă: `128x128` tiles.
+
+Fișierul din repository și copia instalată local în Warcraft sunt byte-identice.
+Aceeași hartă trebuie să existe pe ambele Mac-uri la calea relativă de mai sus.
+Fișierul nu este inclus automat în Git sau în bundle-ul aplicației.
 
 ## Arhitectura țintă
 
@@ -105,7 +118,7 @@ open proxy sau într-un vector SSRF.
 
 ## Framing și parser W3GS
 
-Se introduce crate-ul `strajer-w3gs`, fără dependențe de Axum, DNS-SD sau UI.
+Crate-ul `strajer-w3gs` nu are dependențe de Axum, DNS-SD sau UI.
 
 Frame-ul de bază W3GS:
 
@@ -133,6 +146,18 @@ Reguli obligatorii:
 - fixture-uri redacted și teste pentru frame trunchiat, lungime invalidă, NUL lipsă
   și concatenarea mai multor frame-uri într-un singur read TCP;
 - fuzzing pentru decoder înainte de expunerea publică a tunnel ingress-ului.
+
+Status J0 la 30 august 2026:
+
+- `FrameReader` tratează corect fragmentarea și coalescing-ul TCP;
+- signature, minimum length și limita configurată sunt validate înainte de
+  alocarea payload-ului;
+- `ReqJoin` decodează prefixul confirmat și păstrează tail-ul necunoscut byte cu
+  byte pentru compatibilitate Reforged;
+- agentul nu loghează entry key, player name, IP sau payload hex;
+- `Strajer.app` afișează `Join request detected` printr-un eveniment JSON care
+  conține numai ID-ul intern al lobby-ului;
+- captura unui fixture real din `2.0.4.23745` rămâne următorul gate.
 
 ## Host engine minim
 
@@ -262,9 +287,9 @@ wire protocol-ul Reforged curent și implementările W3GS clasice disponibile pu
 
 Ordinea recomandată, fără schimbări speculative în host engine:
 
-1. creează `strajer-w3gs` cu `FrameHeader`, `FrameReader` și `ReqJoin`;
-2. înlocuiește read-ul unic de 4 KiB din agent cu citire framed și timeout-uri;
-3. capturează și redactează primul fixture real din `2.0.4.23745`;
+1. `strajer-w3gs` cu `FrameHeader`, `FrameReader` și `ReqJoin` — implementat;
+2. înlocuirea read-ului unic de 4 KiB cu citire framed și timeout — implementată;
+3. capturarea și redactarea primului fixture real din `2.0.4.23745` — următorul gate;
 4. fixează schema `REQJOIN` pe baza fixture-ului;
 5. abia apoi definește envelope-ul WSS și endpoint-ul server-side.
 

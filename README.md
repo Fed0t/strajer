@@ -11,7 +11,8 @@ Primul vertical slice implementează:
 - contracte versionate între server și agent;
 - un publisher macOS DNS-SD compatibil cu formatul LAN Reforged;
 - reclame Bonjour `LocalOnly`, fără coliziuni între două Mac-uri Strajer din același LAN;
-- un listener local pregătit să captureze primul pachet trimis de `Join`;
+- descriptor LAN verificat pentru `Maps\Download\DotA_v6_89Q.w3x`;
+- un frame reader W3GS incremental și un parser sigur pentru primul `REQJOIN`;
 - un `Strajer.app` nativ SwiftUI cu iconiță în menu bar, status și agent Rust inclus.
 
 Host engine-ul W3GS, map transfer-ul și pornirea jocului sunt milestone-uri ulterioare. Strajer nu modifică Warcraft III și nu publică jocuri în catalogul Battle.net.

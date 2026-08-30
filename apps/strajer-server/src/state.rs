@@ -6,6 +6,12 @@ use strajer_protocol::{
     LobbyDescriptor, MapDescriptor, PlayerCount, ValidationError, WarcraftDescriptor,
 };
 
+const DOTA_MAP_PATH: &str = "Maps\\Download\\DotA_v6_89Q.w3x";
+const DOTA_MAP_SHA1_HEX: &str = "c771ac8d7dc3665a211c2b1432672d49bfba1bcf";
+const DOTA_MAP_CHECKSUM: u32 = 448_311_427;
+const DOTA_MAP_WIDTH: u16 = 128;
+const DOTA_MAP_HEIGHT: u16 = 128;
+
 #[derive(Clone)]
 pub struct AppState {
     catalog: Arc<LobbyCatalog>,
@@ -38,11 +44,11 @@ impl AppState {
                     product: DEFAULT_WARCRAFT_PRODUCT.to_owned(),
                 },
                 map: MapDescriptor {
-                    path: "Maps\\Strajer\\Synthetic.w3x".to_owned(),
-                    sha1_hex: "00".repeat(20),
-                    checksum: u32::MAX,
-                    width: 0,
-                    height: 0,
+                    path: DOTA_MAP_PATH.to_owned(),
+                    sha1_hex: DOTA_MAP_SHA1_HEX.to_owned(),
+                    checksum: DOTA_MAP_CHECKSUM,
+                    width: DOTA_MAP_WIDTH,
+                    height: DOTA_MAP_HEIGHT,
                 },
                 players: PlayerCount {
                     current: 1,

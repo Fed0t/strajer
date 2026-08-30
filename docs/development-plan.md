@@ -61,6 +61,11 @@ Criteriu de ieșire:
 
 - două Mac-uri trimit `REQJOIN` valid aceluiași lobby Linux, fără port forwarding pe clienți.
 
+Status la 30 august 2026: framing-ul incremental și parserul tolerant `REQJOIN`
+sunt integrate în agent, descriptorul DotA real este verificat și aplicația
+afișează detectarea unui join valid. Fixture-ul Reforged real, tunnel-ul și
+autentificarea rămân deschise.
+
 Specificația tehnică, deciziile de transport și criteriile intermediare J0–J4
 sunt detaliate în [Plan pentru join W3GS real](join-plan.md).
 
@@ -113,7 +118,10 @@ Criteriu de ieșire:
 
 - după instalare și acordarea permisiunii Local Network nu există configurare manuală.
 
-Status la 30 august 2026: shell-ul `MenuBarExtra`, agentul inclus, statusul și build-ul universal sunt implementate. Launch at login, update-ul semnat, crash reporting, Developer ID și notarizarea rămân deschise.
+Status la 30 august 2026: shell-ul `MenuBarExtra`, agentul inclus, statusul,
+indicatorul `Join request detected` și build-ul universal sunt implementate.
+Launch at login, update-ul semnat, crash reporting, Developer ID și notarizarea
+rămân deschise.
 
 ## Milestone 5 — Producție Linux
 

@@ -27,6 +27,11 @@ Contractul observat:
 - `game_data`: structură W3GS codificată ca stat string și Base64;
 - TTL folosit de FLO: `4500` secunde.
 
+Pentru descriptorul hărții, FLO confirmă separarea dintre SHA-1-ul și CRC32-ul
+brut al arhivei MPQ și checksum-ul Xoro calculat peste scriptul și fișierele
+interne relevante. Harta DotA locală a fost citită read-only cu StormLib, care
+suportă compresia PKWare DCL folosită de arhivă.
+
 Pentru framing și host engine vor fi comparate independent:
 
 - [GHost++ `gameprotocol.cpp`](https://github.com/dcramer/ghostplusplus/blob/master/ghost/gameprotocol.cpp),
