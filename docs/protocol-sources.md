@@ -29,8 +29,18 @@ Contractul observat:
 
 Pentru framing și host engine vor fi comparate independent:
 
-- [ghostpp-rs](https://github.com/Fatorin/ghostpp-rs), Apache-2.0;
-- [GHost++](https://github.com/dcramer/ghostplusplus);
+- [GHost++ `gameprotocol.cpp`](https://github.com/dcramer/ghostplusplus/blob/master/ghost/gameprotocol.cpp),
+  inclusiv layout-ul clasic `W3GS_REQJOIN` și generarea `SLOTINFOJOIN`;
+- [ghostpp-rs](https://github.com/Fatorin/ghostpp-rs), Apache-2.0, ca referință
+  pentru framing și modelul actor;
+- [gowarcraft3 W3GS client](https://github.com/nielsAD/gowarcraft3/blob/master/cmd/w3gsclient/main.go),
+  ca implementare independentă;
+- [Wireshark BNETP/W3GS dissector](https://github.com/diegonc/packet-bnetp/blob/main/packet-bnetp-w3gs.lua),
+  pentru verificarea packet ID-urilor;
 - capturi locale controlate pe build-ul Reforged instalat.
+
+Implementările publice clasice nu sunt tratate drept dovadă că Reforged păstrează
+identic fiecare câmp. Fixture-urile build-ului local au prioritate când există o
+diferență observată.
 
 Orice cod reutilizat substanțial dintr-un proiect terț trebuie însoțit de licența și atribuirea corespunzătoare. În milestone-ul curent sunt implementate doar contractele wire necesare interoperabilității.

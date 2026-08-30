@@ -10,6 +10,7 @@ Primul vertical slice implementează:
 - un lobby sintetic determinist;
 - contracte versionate între server și agent;
 - un publisher macOS DNS-SD compatibil cu formatul LAN Reforged;
+- reclame Bonjour `LocalOnly`, fără coliziuni între două Mac-uri Strajer din același LAN;
 - un listener local pregătit să captureze primul pachet trimis de `Join`;
 - un `Strajer.app` nativ SwiftUI cu iconiță în menu bar, status și agent Rust inclus.
 
@@ -56,6 +57,7 @@ Pentru un alt Mac, `STRAJER_SERVER_URL` trebuie să fie un endpoint accesibil de
 
 - [Plan de dezvoltare](docs/development-plan.md)
 - [Arhitectură](docs/architecture.md)
+- [Plan pentru join W3GS real](docs/join-plan.md)
 - [Sursele protocolului LAN](docs/protocol-sources.md)
 - [Validarea milestone-ului M0](docs/validation-m0.md)
 - [Instalare pe alt Mac](docs/install-macos.md)

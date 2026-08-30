@@ -30,7 +30,7 @@ Livrabile:
 - workspace Rust și contracte comune;
 - server HTTP cu `/healthz`, `/readyz` și `/v1/lobbies`;
 - imagine Docker non-root și read-only;
-- publisher DNS-SD macOS pentru recordul Reforged type `66`;
+- publisher DNS-SD macOS `LocalOnly` pentru recordul Reforged type `66`;
 - listener TCP local pentru primul `REQJOIN`;
 - teste unitare pentru service type, protobuf și `game_data`.
 
@@ -38,7 +38,11 @@ Criteriu de ieșire:
 
 - `Strajer Test #1` apare pe două Mac-uri care rulează agentul și consultă același server.
 
-Status la 30 august 2026: validat complet pe primul Mac. Validarea pe al doilea Mac rămâne necesară pentru închiderea milestone-ului.
+Status la 30 august 2026: discovery-ul este validat pe primul Mac, iar cele două
+aplicații se pot conecta simultan la endpoint-ul public. Coliziunea Bonjour
+observată când ambele Mac-uri erau în același LAN a fost corectată prin publicare
+`LocalOnly` și verificată la runtime pe primul Mac. Revalidarea pachetului nou pe
+ambele Mac-uri în același LAN rămâne criteriul final de închidere.
 
 ## Milestone 1 — Join remote end-to-end
 
@@ -56,6 +60,9 @@ Livrabile:
 Criteriu de ieșire:
 
 - două Mac-uri trimit `REQJOIN` valid aceluiași lobby Linux, fără port forwarding pe clienți.
+
+Specificația tehnică, deciziile de transport și criteriile intermediare J0–J4
+sunt detaliate în [Plan pentru join W3GS real](join-plan.md).
 
 ## Milestone 2 — Lobby W3GS real
 
@@ -130,7 +137,8 @@ Criteriu de ieșire:
 - schimbări de protocol între build-urile Reforged;
 - diferențe macOS/Windows în Bonjour și în pachetele W3GS;
 - map hash/checksum și accesul la CASC;
-- TCP-over-tunnel, head-of-line blocking și reconnect;
+- WSS/TCP folosit prea mult după proof-of-concept, head-of-line blocking și reconnect;
+- listener local expus pe interfața LAN înainte de verificarea bind-ului loopback;
 - limite EULA și autorizare pentru distribuție publică;
 - semnare/notarizare și Local Network privacy pe macOS.
 

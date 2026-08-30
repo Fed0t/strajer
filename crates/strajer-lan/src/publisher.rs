@@ -19,18 +19,14 @@ pub struct PublishedLobby {
 #[cfg(target_os = "macos")]
 impl PublishedLobby {
     pub async fn publish(lobby: &LobbyDescriptor, local_port: u16) -> Result<Self, LanError> {
-        use async_dnssd::{RegisterData, RegisterFlags, Type, register_extended};
+        use async_dnssd::{Type, register_extended};
 
         let registration_type = service_registration_type(&lobby.warcraft.version)?;
         let record_data = encode_game_info_record(lobby, local_port)?;
         let pending_registration = register_extended(
             &registration_type,
             local_port,
-            RegisterData {
-                flags: RegisterFlags::NO_AUTO_RENAME | RegisterFlags::UNIQUE,
-                name: Some(&lobby.name),
-                ..Default::default()
-            },
+            local_registration_data(&lobby.name),
         )
         .map_err(LanError::Bonjour)?;
 
@@ -50,6 +46,18 @@ impl PublishedLobby {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn local_registration_data(service_name: &str) -> async_dnssd::RegisterData<'_> {
+    use async_dnssd::{Interface, RegisterData, RegisterFlags};
+
+    RegisterData {
+        flags: RegisterFlags::NO_AUTO_RENAME | RegisterFlags::UNIQUE,
+        interface: Interface::LocalOnly,
+        name: Some(service_name),
+        ..Default::default()
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 pub struct PublishedLobby;
 
@@ -57,5 +65,22 @@ pub struct PublishedLobby;
 impl PublishedLobby {
     pub async fn publish(_lobby: &LobbyDescriptor, _local_port: u16) -> Result<Self, LanError> {
         Err(LanError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use async_dnssd::{Interface, RegisterFlags};
+
+    use super::*;
+
+    #[test]
+    fn restricts_the_lobby_advertisement_to_the_local_machine() {
+        let registration = local_registration_data("Strajer Test #1");
+
+        assert_eq!(registration.interface, Interface::LocalOnly);
+        assert_eq!(registration.name, Some("Strajer Test #1"));
+        assert!(registration.flags.contains(RegisterFlags::NO_AUTO_RENAME));
+        assert!(registration.flags.contains(RegisterFlags::UNIQUE));
     }
 }
