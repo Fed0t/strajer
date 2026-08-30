@@ -1,0 +1,284 @@
+use std::collections::HashSet;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+pub const CATALOG_SCHEMA_VERSION: u16 = 1;
+pub const DEFAULT_WARCRAFT_PRODUCT: &str = "W3XP";
+pub const DEFAULT_WARCRAFT_VERSION: &str = "2.0.4.23745";
+pub const MAX_GAME_NAME_BYTES: usize = 31;
+pub const MAX_WARCRAFT_PLAYERS: u8 = 24;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LobbyCatalog {
+    pub schema_version: u16,
+    pub generated_at_unix_ms: u64,
+    pub lobbies: Vec<LobbyDescriptor>,
+}
+
+impl LobbyCatalog {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.schema_version != CATALOG_SCHEMA_VERSION {
+            return Err(ValidationError::UnsupportedSchemaVersion {
+                actual: self.schema_version,
+                expected: CATALOG_SCHEMA_VERSION,
+            });
+        }
+
+        let mut lobby_ids = HashSet::with_capacity(self.lobbies.len());
+        let mut game_ids = HashSet::with_capacity(self.lobbies.len());
+
+        for lobby in &self.lobbies {
+            lobby.validate()?;
+
+            if !lobby_ids.insert(lobby.id.as_str()) {
+                return Err(ValidationError::DuplicateLobbyId(lobby.id.clone()));
+            }
+
+            if !game_ids.insert(lobby.lan_game_id) {
+                return Err(ValidationError::DuplicateLanGameId(lobby.lan_game_id));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LobbyDescriptor {
+    pub id: String,
+    pub revision: u64,
+    pub lan_game_id: u32,
+    pub game_secret: u32,
+    pub name: String,
+    pub created_at_unix_seconds: u64,
+    pub warcraft: WarcraftDescriptor,
+    pub map: MapDescriptor,
+    pub players: PlayerCount,
+}
+
+impl LobbyDescriptor {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_lobby_id(&self.id)?;
+        validate_game_name(&self.name)?;
+
+        if self.lan_game_id == 0 || self.lan_game_id > i32::MAX as u32 {
+            return Err(ValidationError::InvalidLanGameId(self.lan_game_id));
+        }
+
+        if self.revision == 0 || self.revision > i32::MAX as u64 {
+            return Err(ValidationError::InvalidRevision(self.revision));
+        }
+
+        self.warcraft.validate()?;
+        self.map.validate()?;
+        self.players.validate()?;
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WarcraftDescriptor {
+    pub version: String,
+    pub product: String,
+}
+
+impl WarcraftDescriptor {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.product != DEFAULT_WARCRAFT_PRODUCT {
+            return Err(ValidationError::UnsupportedWarcraftProduct(
+                self.product.clone(),
+            ));
+        }
+
+        validate_warcraft_version(&self.version)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MapDescriptor {
+    pub path: String,
+    pub sha1_hex: String,
+    pub checksum: u32,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl MapDescriptor {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.path.is_empty() || self.path.contains('\0') {
+            return Err(ValidationError::InvalidMapPath);
+        }
+
+        self.sha1_bytes()?;
+        Ok(())
+    }
+
+    pub fn sha1_bytes(&self) -> Result<[u8; 20], ValidationError> {
+        let mut bytes = [0_u8; 20];
+        hex::decode_to_slice(&self.sha1_hex, &mut bytes)
+            .map_err(|_| ValidationError::InvalidMapSha1)?;
+        Ok(bytes)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlayerCount {
+    pub current: u8,
+    pub max: u8,
+}
+
+impl PlayerCount {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.max == 0 || self.max > MAX_WARCRAFT_PLAYERS || self.current > self.max {
+            return Err(ValidationError::InvalidPlayerCount {
+                current: self.current,
+                max: self.max,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum ValidationError {
+    #[error("unsupported catalog schema version {actual}; expected {expected}")]
+    UnsupportedSchemaVersion { actual: u16, expected: u16 },
+    #[error("lobby id must contain 1 to 64 printable ASCII bytes")]
+    InvalidLobbyId,
+    #[error("duplicate lobby id: {0}")]
+    DuplicateLobbyId(String),
+    #[error("LAN game id must be in the range 1..={}", i32::MAX)]
+    InvalidLanGameId(u32),
+    #[error("duplicate LAN game id: {0}")]
+    DuplicateLanGameId(u32),
+    #[error("lobby revision must be in the range 1..={}", i32::MAX)]
+    InvalidRevision(u64),
+    #[error("game name must contain 1 to {MAX_GAME_NAME_BYTES} UTF-8 bytes and no NUL byte")]
+    InvalidGameName,
+    #[error("unsupported Warcraft product: {0}")]
+    UnsupportedWarcraftProduct(String),
+    #[error("Warcraft version must contain exactly four numeric components")]
+    InvalidWarcraftVersion,
+    #[error("map path must not be empty or contain a NUL byte")]
+    InvalidMapPath,
+    #[error("map SHA-1 must contain exactly 40 hexadecimal characters")]
+    InvalidMapSha1,
+    #[error("invalid player count: {current}/{max}")]
+    InvalidPlayerCount { current: u8, max: u8 },
+}
+
+fn validate_lobby_id(id: &str) -> Result<(), ValidationError> {
+    if id.is_empty() || id.len() > 64 || !id.bytes().all(is_printable_ascii) {
+        return Err(ValidationError::InvalidLobbyId);
+    }
+
+    Ok(())
+}
+
+fn is_printable_ascii(byte: u8) -> bool {
+    byte.is_ascii_graphic()
+}
+
+fn validate_game_name(name: &str) -> Result<(), ValidationError> {
+    if name.is_empty() || name.len() > MAX_GAME_NAME_BYTES || name.contains('\0') {
+        return Err(ValidationError::InvalidGameName);
+    }
+
+    Ok(())
+}
+
+fn validate_warcraft_version(version: &str) -> Result<(), ValidationError> {
+    let mut component_count = 0_u8;
+
+    for component in version.split('.') {
+        component_count += 1;
+        if component.is_empty() || !component.bytes().all(is_ascii_digit) {
+            return Err(ValidationError::InvalidWarcraftVersion);
+        }
+    }
+
+    if component_count != 4 {
+        return Err(ValidationError::InvalidWarcraftVersion);
+    }
+
+    Ok(())
+}
+
+fn is_ascii_digit(byte: u8) -> bool {
+    byte.is_ascii_digit()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_a_catalog() {
+        let catalog = valid_catalog();
+        assert_eq!(catalog.validate(), Ok(()));
+        assert_eq!(catalog.lobbies[0].map.sha1_bytes(), Ok([0_u8; 20]));
+    }
+
+    #[test]
+    fn rejects_duplicate_ids() {
+        let mut catalog = valid_catalog();
+        catalog.lobbies.push(catalog.lobbies[0].clone());
+
+        assert_eq!(
+            catalog.validate(),
+            Err(ValidationError::DuplicateLobbyId("synthetic-1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_versions() {
+        let mut catalog = valid_catalog();
+        catalog.lobbies[0].warcraft.version = "2.0.4".to_owned();
+
+        assert_eq!(
+            catalog.validate(),
+            Err(ValidationError::InvalidWarcraftVersion)
+        );
+    }
+
+    #[test]
+    fn rejects_game_names_larger_than_the_wire_limit() {
+        let mut catalog = valid_catalog();
+        catalog.lobbies[0].name = "x".repeat(MAX_GAME_NAME_BYTES + 1);
+
+        assert_eq!(catalog.validate(), Err(ValidationError::InvalidGameName));
+    }
+
+    fn valid_catalog() -> LobbyCatalog {
+        LobbyCatalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            generated_at_unix_ms: 1_000,
+            lobbies: vec![LobbyDescriptor {
+                id: "synthetic-1".to_owned(),
+                revision: 1,
+                lan_game_id: 1,
+                game_secret: 42,
+                name: "Strajer Test #1".to_owned(),
+                created_at_unix_seconds: 1,
+                warcraft: WarcraftDescriptor {
+                    version: DEFAULT_WARCRAFT_VERSION.to_owned(),
+                    product: DEFAULT_WARCRAFT_PRODUCT.to_owned(),
+                },
+                map: MapDescriptor {
+                    path: "Maps\\Strajer\\Synthetic.w3x".to_owned(),
+                    sha1_hex: "00".repeat(20),
+                    checksum: u32::MAX,
+                    width: 0,
+                    height: 0,
+                },
+                players: PlayerCount {
+                    current: 1,
+                    max: MAX_WARCRAFT_PLAYERS,
+                },
+            }],
+        }
+    }
+}

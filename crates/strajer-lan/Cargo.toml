@@ -1,0 +1,15 @@
+[package]
+name = "strajer-lan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+base64.workspace = true
+prost.workspace = true
+strajer-protocol = { path = "../strajer-protocol" }
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+async-dnssd.workspace = true

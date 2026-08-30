@@ -1,0 +1,18 @@
+[package]
+name = "strajer-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strajer-lan = { path = "../../crates/strajer-lan" }
+strajer-protocol = { path = "../../crates/strajer-protocol" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
