@@ -38,9 +38,10 @@ curl http://<linux-server-lan-ip>:18080/v1/lobbies
 Catalogul nou trebuie să raporteze `"current":1`, `"max":11` si
 `"virtual_host":{"player_id":11,"slot_index":10,"name":"Strajer"}`. Endpoint-ul
 `/v1/lobbies/synthetic-1/session` este WebSocket și necesită bearer token.
-Catalogul schema `3` si protocolul de sesiune `2` introduc host-ul virtual,
-`ready`, countdown si start; deploy-ul serverului și build-urile noi de client
-trebuie coordonate.
+Catalogul schema `3` si protocolul de sesiune `3` introduc host-ul virtual,
+chatul bidirectional, `ready`, countdown si `!start`; deploy-ul serverului si
+build-urile noi de client trebuie coordonate. Un client cu session protocol `2`
+este refuzat intentionat de serverul nou.
 
 ## Nginx Proxy Manager
 

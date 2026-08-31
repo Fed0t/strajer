@@ -40,7 +40,10 @@ dimensiunea, CRC32-ul și SHA-1-ul hărții montate read-only. Alocă player ID-
 și sloturile umane, rezervă host-ul virtual, publică roster-ul versionat și
 curăță sesiunile la disconnect. După ce toate cele 10 sesiuni confirmă harta,
 serverul deține countdown-ul de 60 secunde și anulează startul dacă un player
-pleacă.
+pleacă. Chatul lobby este retransmis autoritativ tuturor jucatorilor. La 10/10
+ready countdown-ul porneste automat; pentru testele cu minimum doi jucatori,
+comanda `!start` il porneste imediat sau il armeaza pana cand toate sesiunile
+conectate confirma harta.
 Persistența și identitatea per instalare nu sunt încă implementate.
 
 ### `strajer-agent`
@@ -84,6 +87,10 @@ fisier necunoscut nu este suprascris. Endpoint-ul este inclus
 10. Agentul confirma `ready` numai dupa verificarea hartii. La 10/10 jucatori
     ready, serverul publica 60/50/40/30/20/10 in chat prin host-ul virtual
     `Strajer`, apoi trimite tuturor tranzitia W3GS spre loading.
+11. Mesajele lobby `W3GS_CHAT_TO_HOST` sunt validate local, trimise prin WSS si
+    reproiectate pe fiecare Mac ca `W3GS_CHAT_FROM_HOST`. `!start` este o comanda
+    server-side, nu un mesaj retransmis; necesita minimum doi jucatori si ready
+    pentru toate sesiunile conectate.
 
 `LocalOnly` este intenționat: fiecare Mac trebuie să vadă numai proxy-ul său
 local, chiar dacă mai multe Mac-uri Strajer sunt în același LAN. Serverul Linux
@@ -95,7 +102,8 @@ rămâne singurul loc în care sesiunile celor două proxy-uri sunt reunite.
 - Milestone 1 curent: control persistent WSS autentificat pe `443/tcp`.
 - Milestone 2 curent: registry de lobby server-side și proiecție W3GS locală.
 - Milestone 2.1 curent: distribuție HTTPS, cache verificat și map transfer W3GS.
-- Milestone 3 curent: host virtual, ready, countdown si start spre loading.
+- Milestone 3 curent: host virtual, chat, ready, countdown automat/manual si
+  start spre loading.
 - Milestone 3.1: load sync uman, action loop, leave/lag si replay.
 - Milestone 4: QUIC pe `443/udp`, WSS fallback și reconectare măsurată.
 

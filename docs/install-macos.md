@@ -49,6 +49,10 @@ shasum -a 256 -c Strajer-0.1.0-macos-universal.zip.sha256
 9. Verifica `Offline LAN fix: Ready`, apoi intra in `Local Area Network`.
 10. Ambii jucători aleg `Strajer Test #1`; după join trebuie să apară `3/11`:
     cele doua nume umane plus `Strajer` in slotul `HOSTBOT`.
+11. Mesajele scrise in chat trebuie sa apara pe ambele Mac-uri cu nickname-ul
+    expeditorului. Pentru testul cu doua Mac-uri, scrie `!start`; countdown-ul de
+    60 secunde porneste cand ambii jucatori au harta verificata. Daca unul inca
+    descarca harta, comanda ramane armata pana cand devine ready.
 
 Strajer activeaza automat preferinta Warcraft `Allow Local Files`. Bundle-ul nu
 contine si nu redistribuie fisiere Blizzard: patch-ul este derivat din versiunea

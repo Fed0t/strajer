@@ -16,13 +16,13 @@ use socket2::{Domain, Protocol, Socket, Type};
 use strajer_lan::PublishedLobby;
 use strajer_protocol::{LobbyCatalog, LobbyDescriptor, LobbyPlayer, LobbyRoster};
 use strajer_w3gs::{
-    CHAT_TO_HOST_PACKET_ID, Frame, FrameReader, LEAVE_REQUEST_PACKET_ID, MAP_PART_DATA_BYTES,
-    MAP_PART_NOT_OK_PACKET_ID, MAP_PART_OK_PACKET_ID, MAP_SIZE_PACKET_ID, MapCheck, MapPartAck,
-    MapSize, PONG_TO_HOST_PACKET_ID, PROTOBUF_PACKET_ID, ProtobufEnvelope, RACE_HUMAN,
-    RACE_NIGHT_ELF, RACE_UNDEAD, ReqJoin, SlotData, SlotInfo, SlotLayout, chat_from_host,
-    countdown_end, countdown_start, game_loaded_others_frame, leave_ack, map_part_frame,
-    ping_from_host, player_info_frame, player_leave_others_frame, player_profile_frame,
-    player_skins_frame, start_download_frame,
+    CHAT_TO_HOST_PACKET_ID, ControlFrameError, Frame, FrameReader, LEAVE_REQUEST_PACKET_ID,
+    LobbyChatToHost, MAP_PART_DATA_BYTES, MAP_PART_NOT_OK_PACKET_ID, MAP_PART_OK_PACKET_ID,
+    MAP_SIZE_PACKET_ID, MapCheck, MapPartAck, MapSize, PONG_TO_HOST_PACKET_ID, PROTOBUF_PACKET_ID,
+    ProtobufEnvelope, RACE_HUMAN, RACE_NIGHT_ELF, RACE_UNDEAD, ReqJoin, SlotData, SlotInfo,
+    SlotLayout, chat_from_host, countdown_end, countdown_start, game_loaded_others_frame,
+    leave_ack, map_part_frame, ping_from_host, player_info_frame, player_leave_others_frame,
+    player_profile_frame, player_skins_frame, start_download_frame,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -709,6 +709,36 @@ async fn run_lobby_session(
                             "cancelled automatic start countdown"
                         );
                     }
+                    RemoteLobbyEvent::Chat {
+                        from_player_id,
+                        message,
+                    } => {
+                        if roster.player(from_player_id).is_none() {
+                            bail!("coordinated lobby chat sender is not in the current roster");
+                        }
+                        send_lobby_chat(
+                            &mut stream,
+                            &roster,
+                            from_player_id,
+                            &message,
+                        )
+                        .await?;
+                        debug!(
+                            lobby_id = %config.lobby.id,
+                            from_player_id,
+                            message_bytes = message.len(),
+                            "relayed coordinated lobby chat to Warcraft"
+                        );
+                    }
+                    RemoteLobbyEvent::Notice { message } => {
+                        send_virtual_host_chat(
+                            &config.lobby,
+                            &mut stream,
+                            &roster,
+                            &message,
+                        )
+                        .await?;
+                    }
                     RemoteLobbyEvent::Start => {
                         if game_started {
                             bail!("coordinated lobby sent duplicate game start");
@@ -732,12 +762,21 @@ async fn send_virtual_host_chat(
     roster: &LobbyRoster,
     message: &str,
 ) -> Result<()> {
+    send_lobby_chat(stream, roster, lobby.virtual_host.player_id, message).await
+}
+
+async fn send_lobby_chat(
+    stream: &mut TcpStream,
+    roster: &LobbyRoster,
+    from_player_id: u8,
+    message: &str,
+) -> Result<()> {
     let recipients = roster
         .players
         .iter()
         .map(|player| player.player_id)
         .collect::<Vec<_>>();
-    let frame = chat_from_host(lobby.virtual_host.player_id, &recipients, message)?;
+    let frame = chat_from_host(from_player_id, &recipients, message)?;
     write_frame(stream, &frame).await
 }
 
@@ -860,12 +899,31 @@ async fn handle_lobby_frame(
         PONG_TO_HOST_PACKET_ID => {
             debug!(lobby_id = %config.lobby.id, "received W3GS lobby pong");
         }
-        CHAT_TO_HOST_PACKET_ID => {
-            warn!(
-                lobby_id = %config.lobby.id,
-                "ignored lobby chat or slot change during local join proof"
-            );
-        }
+        CHAT_TO_HOST_PACKET_ID => match LobbyChatToHost::decode(&frame) {
+            Ok(chat) => {
+                if chat.from_player_id() != assigned_player_id {
+                    bail!(
+                        "Warcraft lobby chat sender {} does not match assigned player {assigned_player_id}",
+                        chat.from_player_id()
+                    );
+                }
+                remote_session.send_chat(chat.message().to_owned()).await?;
+                debug!(
+                    lobby_id = %config.lobby.id,
+                    recipient_count = chat.recipient_player_ids().len(),
+                    message_bytes = chat.message().len(),
+                    "forwarded Warcraft lobby chat to coordinated lobby"
+                );
+            }
+            Err(ControlFrameError::UnsupportedChatFlag(flag)) => {
+                debug!(
+                    lobby_id = %config.lobby.id,
+                    flag = format_args!("0x{flag:02X}"),
+                    "ignored unsupported Warcraft lobby slot change"
+                );
+            }
+            Err(error) => return Err(error).context("rejected malformed Warcraft lobby chat"),
+        },
         packet_id => {
             debug!(
                 lobby_id = %config.lobby.id,

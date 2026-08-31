@@ -17,8 +17,12 @@ Primul vertical slice implementează:
 - un frame reader W3GS incremental și validarea sigură a `REQJOIN`;
 - răspunsurile W3GS necesare intrării în lobby și sincronizarea live a roster-ului;
 - un host virtual `Strajer` în slotul `HOSTBOT`, separat de cele 10 sloturi umane;
+- chat lobby bidirectional intre jucatorii conectati, cu identitatea expeditorului
+  validata de agent si derivata server-side din sesiunea autentificata;
 - confirmare de hartă per client și countdown server-side de 60 secunde, cu mesaj
   W3GS la fiecare 10 secunde, anulare la leave și tranziție sincronă spre loading;
+- start automat la 10/10 jucatori sau fallback `!start` de la minimum doi
+  jucatori conectati, dupa ce toti au terminat verificarea hartii;
 - stocare de hartă read-only pe server, download HTTPS autentificat, cache local
   verificat și transfer W3GS către Warcraft când harta lipsește;
 - un `Strajer.app` nativ SwiftUI cu iconiță în menu bar, status, nickname persistent
@@ -61,6 +65,9 @@ STRAJER_SERVER_URL=http://127.0.0.1:18080 \
 ```
 
 După publicarea lobby-ului, deschide Warcraft III și intră în `Local Area Network`.
+Cu doua Mac-uri, scrie `!start` in chatul lobby-ului. Daca verificarea hartii nu
+s-a terminat pe ambele, cererea ramane armata si countdown-ul porneste automat
+cand ambii jucatori devin ready.
 
 Construiește aplicația universală pentru Apple Silicon și Intel:
 

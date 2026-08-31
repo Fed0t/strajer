@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use strajer_protocol::{
     AgentLobbyMessage, LOBBY_SESSION_PROTOCOL_VERSION, LobbyDescriptor, LobbyRoster,
-    MAX_LOBBY_CONTROL_MESSAGE_BYTES, ServerLobbyMessage, validate_lobby_countdown_seconds,
+    MAX_LOBBY_CONTROL_MESSAGE_BYTES, ServerLobbyMessage, validate_lobby_chat_message,
+    validate_lobby_countdown_seconds,
 };
 use tokio::net::TcpStream;
 use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at, timeout};
@@ -36,6 +37,8 @@ pub(crate) enum RemoteLobbyEvent {
     Roster(LobbyRoster),
     Countdown { remaining_seconds: u8 },
     CountdownCancelled,
+    Chat { from_player_id: u8, message: String },
+    Notice { message: String },
     Start,
 }
 
@@ -87,6 +90,8 @@ impl RemoteLobbySession {
             }
             ServerLobbyMessage::Countdown { .. }
             | ServerLobbyMessage::CountdownCancelled
+            | ServerLobbyMessage::Chat { .. }
+            | ServerLobbyMessage::Notice { .. }
             | ServerLobbyMessage::Start => {
                 bail!("coordinated lobby started control flow before join acceptance")
             }
@@ -141,6 +146,12 @@ impl RemoteLobbySession {
         Ok(())
     }
 
+    pub(crate) async fn send_chat(&mut self, message: String) -> Result<()> {
+        let message =
+            AgentLobbyMessage::chat(message).context("Warcraft lobby chat message is not valid")?;
+        send_agent_message(&mut self.socket, &message).await
+    }
+
     pub(crate) async fn next_event(&mut self) -> Result<Option<RemoteLobbyEvent>> {
         loop {
             tokio::select! {
@@ -190,6 +201,25 @@ impl RemoteLobbySession {
             ServerLobbyMessage::CountdownCancelled => {
                 Ok(Some(RemoteLobbyEvent::CountdownCancelled))
             }
+            ServerLobbyMessage::Chat {
+                from_player_id,
+                message,
+            } => {
+                if from_player_id == 0 || from_player_id > self.maximum_players {
+                    bail!("coordinated lobby returned an invalid chat sender");
+                }
+                validate_lobby_chat_message(&message)
+                    .context("coordinated lobby returned an invalid chat message")?;
+                Ok(Some(RemoteLobbyEvent::Chat {
+                    from_player_id,
+                    message,
+                }))
+            }
+            ServerLobbyMessage::Notice { message } => {
+                validate_lobby_chat_message(&message)
+                    .context("coordinated lobby returned an invalid notice")?;
+                Ok(Some(RemoteLobbyEvent::Notice { message }))
+            }
             ServerLobbyMessage::Start => Ok(Some(RemoteLobbyEvent::Start)),
             ServerLobbyMessage::Rejected { code } => {
                 bail!("coordinated lobby rejected the active session: {code:?}")
@@ -219,15 +249,15 @@ async fn send_agent_message(
     socket: &mut LobbyWebSocket,
     message: &AgentLobbyMessage,
 ) -> Result<()> {
-    let text = serde_json::to_string(message).context("could not encode lobby join message")?;
+    let text = serde_json::to_string(message).context("could not encode agent lobby message")?;
     if text.len() > MAX_LOBBY_CONTROL_MESSAGE_BYTES {
-        bail!("encoded lobby join message exceeds configured limit");
+        bail!("encoded agent lobby message exceeds configured limit");
     }
 
     socket
         .send(Message::Text(text.into()))
         .await
-        .context("could not send lobby join message")
+        .context("could not send agent lobby message")
 }
 
 async fn receive_server_message(socket: &mut LobbyWebSocket) -> Result<Option<ServerLobbyMessage>> {
@@ -368,7 +398,7 @@ mod tests {
         )
         .await
         .expect("first session should join");
-        let second = RemoteLobbySession::connect(
+        let mut second = RemoteLobbySession::connect(
             &server_url,
             &lobby,
             "Second#2000".to_owned(),
@@ -382,6 +412,27 @@ mod tests {
         assert_eq!(second.initial_roster().players.len(), 2);
         let synchronized = receive_roster_with_count(&mut first, 2).await;
         assert_eq!(synchronized, *second.initial_roster());
+
+        second
+            .send_chat("hello first player".to_owned())
+            .await
+            .expect("chat should send");
+        assert_eq!(
+            receive_chat(&mut first).await,
+            (2, "hello first player".to_owned())
+        );
+
+        first.mark_ready().await.expect("first should become ready");
+        second
+            .mark_ready()
+            .await
+            .expect("second should become ready");
+        first
+            .send_chat("!start".to_owned())
+            .await
+            .expect("manual start command should send");
+        assert_eq!(receive_countdown(&mut first).await, 60);
+        assert_eq!(receive_countdown(&mut second).await, 60);
 
         drop(second);
         let after_leave = receive_roster_with_count(&mut first, 1).await;
@@ -409,5 +460,43 @@ mod tests {
         })
         .await
         .expect("expected roster should arrive")
+    }
+
+    async fn receive_chat(session: &mut RemoteLobbySession) -> (u8, String) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let event = session
+                    .next_event()
+                    .await
+                    .expect("lobby event should be valid")
+                    .expect("session should remain connected");
+                if let RemoteLobbyEvent::Chat {
+                    from_player_id,
+                    message,
+                } = event
+                {
+                    return (from_player_id, message);
+                }
+            }
+        })
+        .await
+        .expect("expected chat should arrive")
+    }
+
+    async fn receive_countdown(session: &mut RemoteLobbySession) -> u8 {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let event = session
+                    .next_event()
+                    .await
+                    .expect("lobby event should be valid")
+                    .expect("session should remain connected");
+                if let RemoteLobbyEvent::Countdown { remaining_seconds } = event {
+                    return remaining_seconds;
+                }
+            }
+        })
+        .await
+        .expect("expected countdown should arrive")
     }
 }

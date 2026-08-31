@@ -25,7 +25,9 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 use crate::AppState;
-use crate::lobby::{LobbyJoinError, LobbyMembership, LobbyPhase, LobbyRoom, LobbyUpdate};
+use crate::lobby::{
+    LobbyJoinError, LobbyMembership, LobbyPhase, LobbyRoom, LobbyUpdate, ManualStartOutcome,
+};
 
 const LOBBY_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -233,13 +235,15 @@ async fn run_connected_lobby_socket(
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Close(_))) | None => return Ok(()),
                     Some(Ok(Message::Text(text))) => {
-                        handle_active_agent_message(
+                        if let Some(response) = handle_active_agent_message(
                             room,
                             membership.player_id,
                             membership.session_id,
                             &text,
                         )
-                        .await?;
+                        .await? {
+                            send_server_message(socket, &response).await?;
+                        }
                     }
                     Some(Ok(Message::Binary(_))) => {
                         bail!("unexpected binary client message after lobby join");
@@ -256,6 +260,13 @@ async fn run_connected_lobby_socket(
                     Ok(LobbyUpdate::CountdownCancelled) => {
                         ServerLobbyMessage::CountdownCancelled
                     }
+                    Ok(LobbyUpdate::Chat {
+                        from_player_id,
+                        message,
+                    }) => ServerLobbyMessage::Chat {
+                        from_player_id,
+                        message,
+                    },
                     Ok(LobbyUpdate::Start) => ServerLobbyMessage::Start,
                     Err(broadcast::error::RecvError::Lagged(skipped_updates)) => {
                         warn!(
@@ -298,7 +309,7 @@ async fn handle_active_agent_message(
     player_id: u8,
     session_id: u64,
     text: &str,
-) -> Result<()> {
+) -> Result<Option<ServerLobbyMessage>> {
     if text.len() > MAX_LOBBY_CONTROL_MESSAGE_BYTES {
         bail!("lobby client message exceeds configured limit");
     }
@@ -310,12 +321,49 @@ async fn handle_active_agent_message(
         .context("active lobby client message failed validation")?;
 
     match message {
-        AgentLobbyMessage::Ready { .. } => room
-            .mark_ready(player_id, session_id)
-            .await
-            .context("could not mark lobby player ready"),
+        AgentLobbyMessage::Ready { .. } => {
+            room.mark_ready(player_id, session_id)
+                .await
+                .context("could not mark lobby player ready")?;
+            Ok(None)
+        }
+        AgentLobbyMessage::Chat { message, .. } if is_manual_start_command(&message) => {
+            let outcome = room
+                .request_manual_start(player_id, session_id)
+                .await
+                .context("could not process manual lobby start")?;
+            Ok(manual_start_notice(outcome))
+        }
+        AgentLobbyMessage::Chat { message, .. } => {
+            room.publish_chat(player_id, session_id, message)
+                .await
+                .context("could not publish lobby chat")?;
+            Ok(None)
+        }
         AgentLobbyMessage::Join { .. } => bail!("duplicate lobby join message"),
     }
+}
+
+fn is_manual_start_command(message: &str) -> bool {
+    message.trim().eq_ignore_ascii_case("!start")
+}
+
+fn manual_start_notice(outcome: ManualStartOutcome) -> Option<ServerLobbyMessage> {
+    let message = match outcome {
+        ManualStartOutcome::Started => return None,
+        ManualStartOutcome::AlreadyCountingDown => "Countdown is already running.",
+        ManualStartOutcome::AlreadyStarted => "The game has already started.",
+        ManualStartOutcome::NotEnoughPlayers => {
+            "At least two players must be in the lobby before !start."
+        }
+        ManualStartOutcome::PlayersNotReady => {
+            "Manual start armed; waiting for every connected player to finish map verification."
+        }
+    };
+
+    Some(ServerLobbyMessage::Notice {
+        message: message.to_owned(),
+    })
 }
 
 async fn send_server_message(socket: &mut WebSocket, message: &ServerLobbyMessage) -> Result<()> {
@@ -343,7 +391,9 @@ fn map_validation_error(error: LobbySessionValidationError) -> LobbyJoinRejectio
 fn map_join_error(error: &LobbyJoinError) -> LobbyJoinRejection {
     match error {
         LobbyJoinError::Full => LobbyJoinRejection::LobbyFull,
-        LobbyJoinError::Started => LobbyJoinRejection::LobbyStarted,
+        LobbyJoinError::Started | LobbyJoinError::CountdownActive => {
+            LobbyJoinRejection::LobbyStarted
+        }
         LobbyJoinError::DuplicatePlayerName => LobbyJoinRejection::DuplicatePlayerName,
         LobbyJoinError::SessionIdExhausted => LobbyJoinRejection::InvalidRequest,
     }
@@ -565,6 +615,49 @@ mod tests {
         server_task.abort();
     }
 
+    #[tokio::test]
+    async fn relays_lobby_chat_and_accepts_manual_start_with_two_ready_players() {
+        let (endpoint, server_task) = start_websocket_server().await;
+        let mut first = connect_lobby_client(&endpoint, "First#1000").await;
+        receive_joined(&mut first).await;
+        let mut second = connect_lobby_client(&endpoint, "Second#2000").await;
+        receive_joined(&mut second).await;
+        receive_roster_with_count(&mut first, 2).await;
+
+        send_agent_control(
+            &mut first,
+            AgentLobbyMessage::chat("hello second player".to_owned())
+                .expect("chat should be valid"),
+        )
+        .await;
+        assert_eq!(
+            receive_chat(&mut first).await,
+            (1, "hello second player".to_owned())
+        );
+        assert_eq!(
+            receive_chat(&mut second).await,
+            (1, "hello second player".to_owned())
+        );
+
+        send_agent_control(
+            &mut first,
+            AgentLobbyMessage::chat("!START".to_owned()).expect("command should be valid"),
+        )
+        .await;
+        assert!(
+            receive_notice(&mut first)
+                .await
+                .contains("finish map verification")
+        );
+
+        send_agent_control(&mut first, AgentLobbyMessage::ready()).await;
+        send_agent_control(&mut second, AgentLobbyMessage::ready()).await;
+
+        assert_eq!(receive_countdown(&mut first).await, 60);
+        assert_eq!(receive_countdown(&mut second).await, 60);
+        server_task.abort();
+    }
+
     type TestLobbySocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
     async fn start_websocket_server() -> (String, JoinHandle<()>) {
@@ -633,6 +726,58 @@ mod tests {
         })
         .await
         .expect("expected roster update should arrive")
+    }
+
+    async fn send_agent_control(socket: &mut TestLobbySocket, message: AgentLobbyMessage) {
+        let text = serde_json::to_string(&message).expect("agent message should serialize");
+        socket
+            .send(ClientMessage::Text(text.into()))
+            .await
+            .expect("agent message should send");
+    }
+
+    async fn receive_chat(socket: &mut TestLobbySocket) -> (u8, String) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerLobbyMessage::Chat {
+                    from_player_id,
+                    message,
+                } = receive_control_message(socket).await
+                {
+                    return (from_player_id, message);
+                }
+            }
+        })
+        .await
+        .expect("chat should arrive")
+    }
+
+    async fn receive_notice(socket: &mut TestLobbySocket) -> String {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerLobbyMessage::Notice { message } =
+                    receive_control_message(socket).await
+                {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("notice should arrive")
+    }
+
+    async fn receive_countdown(socket: &mut TestLobbySocket) -> u8 {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerLobbyMessage::Countdown { remaining_seconds } =
+                    receive_control_message(socket).await
+                {
+                    return remaining_seconds;
+                }
+            }
+        })
+        .await
+        .expect("countdown should arrive")
     }
 
     async fn receive_control_message(socket: &mut TestLobbySocket) -> ServerLobbyMessage {

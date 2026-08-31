@@ -57,7 +57,7 @@ aparține milestone-ului de gameplay.
   WSS.
 
 Join-ul simultan pe doua Mac-uri este validat. Urmatorul deploy trebuie sa
-actualizeze coordonat serverul la catalog schema `3` / session protocol `2` si
+actualizeze coordonat serverul la catalog schema `3` / session protocol `3` si
 ambele aplicatii; versiunile vechi sunt refuzate intentionat. Tranzitia spre
 loading este implementata, dar data-plane-ul action-urilor nu este inca.
 
@@ -225,8 +225,8 @@ Ordinea de implementare pentru primul lobby real:
 4. trimite `PLAYERINFO` pentru jucătorii existenți și propagă noul jucător;
 5. trimite `MAPCHECK` cu metadata hărții reale;
 6. procesează răspunsul de map availability și actualizează sloturile;
-7. implementează chat/team/color/ready numai după ce join-ul de bază este stabil;
-8. adaugă countdown, loading synchronization și action loop;
+7. implementează chat si ready numai după ce join-ul de bază este stabil;
+8. adaugă team/color, countdown, loading synchronization și action loop;
 9. adaugă leave, lag handling, desync detection și replay.
 
 Map transfer-ul este implementat ca extensie izolată peste join-ul existent:
@@ -363,6 +363,9 @@ Decizia implementata pentru J3 este:
 - fiecare agent trimite `ready` numai dupa ce Warcraft confirma harta completa;
 - cand toate cele 10 sloturi umane sunt ocupate si ready, serverul porneste
   automat timerul de 60 secunde;
+- pentru testele partiale, `!start` cere minimum doi jucatori si porneste acelasi
+  timer dupa ce toate sesiunile conectate sunt ready; daca ready este inca in
+  curs, comanda ramane armata;
 - serverul publica evenimentele 60/50/40/30/20/10, iar fiecare agent le afiseaza
   in chat ca mesaje W3GS trimise de `Strajer`;
 - orice leave inainte de start anuleaza timerul; un lobby plin si ready il poate
@@ -394,7 +397,7 @@ wire protocol-ul Reforged curent și implementările W3GS clasice disponibile pu
 5. endpoint de hartă, cache verificat și transfer W3GS — implementate, validarea
    live pe client fără hartă este următorul gate;
 6. deploy public și validare simultană pe două Mac-uri — după gate-ul de hartă;
-7. host virtual, ready si countdown autoritativ — implementate;
+7. host virtual, chat, ready si countdown autoritativ automat/manual — implementate;
 8. load sync uman si data-plane de gameplay — etapa următoare.
 
 ## Surse de interoperabilitate

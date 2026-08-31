@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio::time::sleep;
 
 const LOBBY_UPDATE_CAPACITY: usize = 64;
+const MINIMUM_MANUAL_START_PLAYERS: usize = 2;
 
 #[derive(Clone)]
 pub(crate) struct LobbyRegistry {
@@ -82,6 +83,7 @@ impl LobbyRoom {
                 countdown_generation: 0,
                 countdown_active: false,
                 countdown_remaining_seconds: None,
+                manual_start_requested: false,
                 started: false,
             }),
             updates,
@@ -97,6 +99,9 @@ impl LobbyRoom {
 
         if state.started {
             return Err(LobbyJoinError::Started);
+        }
+        if state.countdown_active {
+            return Err(LobbyJoinError::CountdownActive);
         }
 
         if state.players.len() >= usize::from(self.maximum_players) {
@@ -158,28 +163,64 @@ impl LobbyRoom {
             }
             player.ready = true;
 
-            if !state.can_start_countdown(self.maximum_players) {
+            if !state.can_start_automatic_countdown(self.maximum_players)
+                && !state.can_start_requested_countdown()
+            {
                 return Ok(());
             }
 
-            state.countdown_generation = state
-                .countdown_generation
-                .checked_add(1)
-                .ok_or(LobbyMembershipError::CountdownGenerationExhausted)?;
-            state.countdown_active = true;
-            state.countdown_remaining_seconds = Some(self.countdown_policy.initial_seconds);
-            let generation = state.countdown_generation;
-            let _ = self.updates.send(LobbyUpdate::Countdown {
-                remaining_seconds: self.countdown_policy.initial_seconds,
-            });
-            generation
+            self.begin_countdown(&mut state)?
         };
 
-        let room = Arc::clone(self);
-        tokio::spawn(async move {
-            room.run_countdown(countdown_generation).await;
-        });
+        self.spawn_countdown(countdown_generation);
         Ok(())
+    }
+
+    pub(crate) async fn publish_chat(
+        &self,
+        player_id: u8,
+        session_id: u64,
+        message: String,
+    ) -> Result<(), LobbyMembershipError> {
+        let state = self.state.lock().await;
+        state.require_active_session(player_id, session_id)?;
+        let _ = self.updates.send(LobbyUpdate::Chat {
+            from_player_id: player_id,
+            message,
+        });
+        drop(state);
+        Ok(())
+    }
+
+    pub(crate) async fn request_manual_start(
+        self: &Arc<Self>,
+        player_id: u8,
+        session_id: u64,
+    ) -> Result<ManualStartOutcome, LobbyMembershipError> {
+        let (outcome, countdown_generation) = {
+            let mut state = self.state.lock().await;
+            state.require_active_session(player_id, session_id)?;
+
+            if state.started {
+                (ManualStartOutcome::AlreadyStarted, None)
+            } else if state.countdown_active {
+                (ManualStartOutcome::AlreadyCountingDown, None)
+            } else if state.players.len() < MINIMUM_MANUAL_START_PLAYERS {
+                (ManualStartOutcome::NotEnoughPlayers, None)
+            } else if !state.players.values().all(|player| player.ready) {
+                state.manual_start_requested = true;
+                (ManualStartOutcome::PlayersNotReady, None)
+            } else {
+                let generation = self.begin_countdown(&mut state)?;
+                (ManualStartOutcome::Started, Some(generation))
+            }
+        };
+
+        if let Some(generation) = countdown_generation {
+            self.spawn_countdown(generation);
+        }
+
+        Ok(outcome)
     }
 
     pub(crate) async fn leave(&self, player_id: u8, session_id: u64) {
@@ -198,6 +239,7 @@ impl LobbyRoom {
         let countdown_was_active = state.countdown_active;
         state.countdown_active = false;
         state.countdown_remaining_seconds = None;
+        state.manual_start_requested = false;
         let _ = self.updates.send(LobbyUpdate::Roster(roster));
         if countdown_was_active {
             let _ = self.updates.send(LobbyUpdate::CountdownCancelled);
@@ -225,6 +267,28 @@ impl LobbyRoom {
         }
     }
 
+    fn begin_countdown(&self, state: &mut LobbyRoomState) -> Result<u64, LobbyMembershipError> {
+        state.countdown_generation = state
+            .countdown_generation
+            .checked_add(1)
+            .ok_or(LobbyMembershipError::CountdownGenerationExhausted)?;
+        state.countdown_active = true;
+        state.countdown_remaining_seconds = Some(self.countdown_policy.initial_seconds);
+        state.manual_start_requested = false;
+        let generation = state.countdown_generation;
+        let _ = self.updates.send(LobbyUpdate::Countdown {
+            remaining_seconds: self.countdown_policy.initial_seconds,
+        });
+        Ok(generation)
+    }
+
+    fn spawn_countdown(self: &Arc<Self>, generation: u64) {
+        let room = Arc::clone(self);
+        tokio::spawn(async move {
+            room.run_countdown(generation).await;
+        });
+    }
+
     async fn run_countdown(self: Arc<Self>, generation: u64) {
         let mut remaining_seconds = self.countdown_policy.initial_seconds;
 
@@ -241,7 +305,7 @@ impl LobbyRoom {
 
         sleep(self.countdown_policy.tick_interval).await;
         let mut state = self.state.lock().await;
-        if !state.countdown_matches(generation, self.maximum_players) {
+        if !state.countdown_matches(generation) {
             return;
         }
 
@@ -253,7 +317,7 @@ impl LobbyRoom {
 
     async fn publish_countdown_tick(&self, generation: u64, remaining_seconds: u8) -> bool {
         let mut state = self.state.lock().await;
-        if !state.countdown_matches(generation, self.maximum_players) {
+        if !state.countdown_matches(generation) {
             return false;
         }
 
@@ -277,7 +341,17 @@ pub(crate) enum LobbyUpdate {
     Roster(LobbyRoster),
     Countdown { remaining_seconds: u8 },
     CountdownCancelled,
+    Chat { from_player_id: u8, message: String },
     Start,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManualStartOutcome {
+    Started,
+    AlreadyCountingDown,
+    AlreadyStarted,
+    NotEnoughPlayers,
+    PlayersNotReady,
 }
 
 pub(crate) struct LobbyControlSnapshot {
@@ -298,6 +372,8 @@ pub(crate) enum LobbyJoinError {
     Full,
     #[error("lobby has already started")]
     Started,
+    #[error("lobby countdown has already started")]
+    CountdownActive,
     #[error("player name is already present in the lobby")]
     DuplicatePlayerName,
     #[error("lobby session id space is exhausted")]
@@ -319,6 +395,7 @@ struct LobbyRoomState {
     countdown_generation: u64,
     countdown_active: bool,
     countdown_remaining_seconds: Option<u8>,
+    manual_start_requested: bool,
     started: bool,
 }
 
@@ -340,19 +417,42 @@ impl LobbyRoomState {
         }
     }
 
-    fn can_start_countdown(&self, maximum_players: u8) -> bool {
+    fn can_start_automatic_countdown(&self, maximum_players: u8) -> bool {
         !self.started
             && !self.countdown_active
             && self.players.len() == usize::from(maximum_players)
             && self.players.values().all(|player| player.ready)
     }
 
-    fn countdown_matches(&self, generation: u64, maximum_players: u8) -> bool {
+    fn can_start_requested_countdown(&self) -> bool {
+        self.manual_start_requested
+            && !self.started
+            && !self.countdown_active
+            && self.players.len() >= MINIMUM_MANUAL_START_PLAYERS
+            && self.players.values().all(|player| player.ready)
+    }
+
+    fn countdown_matches(&self, generation: u64) -> bool {
         self.countdown_active
             && self.countdown_generation == generation
-            && self.players.len() == usize::from(maximum_players)
             && self.players.values().all(|player| player.ready)
             && !self.started
+    }
+
+    fn require_active_session(
+        &self,
+        player_id: u8,
+        session_id: u64,
+    ) -> Result<(), LobbyMembershipError> {
+        let session_matches = self
+            .players
+            .get(&player_id)
+            .is_some_and(|player| player.session_id == session_id);
+        if !session_matches {
+            return Err(LobbyMembershipError::UnknownSession);
+        }
+
+        Ok(())
     }
 }
 
@@ -531,6 +631,88 @@ mod tests {
                 .await
                 .is_err(),
             "cancelled countdown must not start the game"
+        );
+    }
+
+    #[tokio::test]
+    async fn relays_chat_and_allows_two_ready_players_to_start_manually() {
+        let room = Arc::new(LobbyRoom::new_with_countdown_policy(
+            1,
+            10,
+            CountdownPolicy {
+                initial_seconds: 60,
+                step_seconds: 10,
+                tick_interval: Duration::from_millis(50),
+            },
+        ));
+        let first = room
+            .join("First#1000".to_owned())
+            .await
+            .expect("first player should join");
+        let second = room
+            .join("Second#2000".to_owned())
+            .await
+            .expect("second player should join");
+        let mut updates = first.updates.resubscribe();
+        drain_updates(&mut updates);
+
+        room.publish_chat(first.player_id, first.session_id, "hello lobby".to_owned())
+            .await
+            .expect("chat should publish");
+        assert_eq!(
+            receive_update(&mut updates).await,
+            LobbyUpdate::Chat {
+                from_player_id: first.player_id,
+                message: "hello lobby".to_owned(),
+            }
+        );
+
+        assert_eq!(
+            room.request_manual_start(first.player_id, first.session_id)
+                .await
+                .expect("manual start request should be handled"),
+            ManualStartOutcome::PlayersNotReady
+        );
+        room.mark_ready(first.player_id, first.session_id)
+            .await
+            .expect("first player should become ready");
+        room.mark_ready(second.player_id, second.session_id)
+            .await
+            .expect("second player should become ready");
+        assert_eq!(
+            receive_update(&mut updates).await,
+            LobbyUpdate::Countdown {
+                remaining_seconds: 60,
+            }
+        );
+        assert_eq!(
+            room.request_manual_start(first.player_id, first.session_id)
+                .await
+                .expect("repeated manual start should be handled"),
+            ManualStartOutcome::AlreadyCountingDown
+        );
+        assert_eq!(
+            room.join("Late#3000".to_owned()).await.err(),
+            Some(LobbyJoinError::CountdownActive)
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_start_requires_two_players() {
+        let room = Arc::new(LobbyRoom::new(1, 10));
+        let first = room
+            .join("First#1000".to_owned())
+            .await
+            .expect("first player should join");
+        room.mark_ready(first.player_id, first.session_id)
+            .await
+            .expect("first player should become ready");
+
+        assert_eq!(
+            room.request_manual_start(first.player_id, first.session_id)
+                .await
+                .expect("manual start request should be handled"),
+            ManualStartOutcome::NotEnoughPlayers
         );
     }
 

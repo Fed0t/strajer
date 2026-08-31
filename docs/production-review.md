@@ -16,14 +16,17 @@ lipseste data-plane-ul W3GS care sincronizeaza efectiv jocul intre clienti.
 - catalog HTTPS si sesiune WSS autentificata;
 - map download autentificat, cache atomic verificat SHA-1/CRC32 si transfer W3GS;
 - 10 sloturi umane plus `Strajer` in slotul final `HOSTBOT`;
+- chat lobby bidirectional, cu PID validat local si identitate derivata din
+  sesiunea autentificata pe server;
 - ready dupa verificarea hartii, countdown autoritativ
-  `60/50/40/30/20/10`, anulare la leave si tranzitie spre loading;
+  `60/50/40/30/20/10`, start automat la 10/10, fallback `!start` de la doi
+  jucatori, anulare la leave si tranzitie spre loading;
 - nickname persistent si actiunea `Nickname...` in menu bar;
 - refuz strict al unui WebUI Blizzard care nu are semnatura cunoscuta exact;
 - container Linux non-root, read-only, fara capabilitati si cu healthcheck;
 - build macOS universal `arm64` + `x86_64`, verificat prin `codesign` ad-hoc.
 
-Validarea curenta are 76 de teste Rust, testul Swift pe fixture-ul WebUI real,
+Validarea curenta are 81 de teste Rust, testul Swift pe fixture-ul WebUI real,
 `cargo clippy -D warnings`, verificarea Docker Compose, build-ul imaginii Docker
 si verificarea bundle-ului/ZIP-ului macOS.
 

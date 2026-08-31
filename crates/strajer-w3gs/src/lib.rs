@@ -12,8 +12,8 @@ mod slot;
 pub use control::{
     CHAT_FROM_HOST_PACKET_ID, CHAT_TO_HOST_PACKET_ID, COUNTDOWN_END_PACKET_ID,
     COUNTDOWN_START_PACKET_ID, ControlFrameError, LEAVE_ACK_PACKET_ID, LEAVE_REQUEST_PACKET_ID,
-    MAX_CHAT_MESSAGE_BYTES, PING_FROM_HOST_PACKET_ID, PONG_TO_HOST_PACKET_ID, chat_from_host,
-    countdown_end, countdown_start, leave_ack, ping_from_host,
+    LobbyChatToHost, MAX_CHAT_MESSAGE_BYTES, PING_FROM_HOST_PACKET_ID, PONG_TO_HOST_PACKET_ID,
+    chat_from_host, countdown_end, countdown_start, leave_ack, ping_from_host,
 };
 pub use frame::{FRAME_HEADER_LENGTH, Frame, FrameError, FrameHeader, FrameReader, W3GS_SIGNATURE};
 pub use map::{

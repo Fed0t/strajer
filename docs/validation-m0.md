@@ -12,8 +12,8 @@ Actualizat: 31 august 2026.
 ## Verificări reușite
 
 - `cargo fmt --all --check`;
-- `cargo test --workspace --all-targets`: 76 teste trecute pentru protocol,
-  framing W3GS, LAN, server, agent, countdown si map transfer;
+- `cargo test --workspace --all-targets`: 81 teste trecute pentru protocol,
+  framing W3GS, LAN, server, agent, chat, countdown si map transfer;
 - `cargo clippy --workspace --all-targets -- -D warnings`;
 - build Linux al imaginii `strajer-strajer-server` din `Cargo.lock`;
 - container `healthy`, UID/GID `10001:10001`, root filesystem read-only, toate capabilities eliminate și `no-new-privileges` activ;
@@ -41,6 +41,8 @@ Actualizat: 31 august 2026.
   playerul virtual `Strajer`;
 - serverul testeaza countdown-ul 60/50/40/30/20/10, anularea la leave si startul
   numai dupa ready pentru toti jucatorii;
+- testele end-to-end WSS valideaza chatul in ambele directii si `!start` armat
+  inainte de ready pentru un lobby partial cu doi jucatori;
 - listener-ele Warcraft sunt verificate pe acelasi port, exclusiv pe loopback
   IPv4 si IPv6;
 - executabilele SwiftUI și Rust din bundle conțin ambele arhitecturi: `arm64` și `x86_64`;
@@ -48,7 +50,8 @@ Actualizat: 31 august 2026.
 
 ## Încă nevalidate
 
-- deploy-ul coordonat schema catalog `3` / session protocol `2`;
+- deploy-ul coordonat schema catalog `3` / session protocol `3`;
+- afisarea live a chatului bidirectional si validarea `!start` pe ambele Mac-uri;
 - afisarea live `Strajer` in `HOSTBOT` si countdown-ul chat pe ambele Mac-uri;
 - tranzitia live simultana a celor 10 clienti spre loading;
 - load sync uman, action data-plane, leave/lag handling si replay;

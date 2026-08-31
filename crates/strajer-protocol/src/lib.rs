@@ -6,10 +6,11 @@ use thiserror::Error;
 pub const CATALOG_SCHEMA_VERSION: u16 = 3;
 pub const DEFAULT_WARCRAFT_PRODUCT: &str = "W3XP";
 pub const DEFAULT_WARCRAFT_VERSION: &str = "2.0.4.23745";
-pub const LOBBY_SESSION_PROTOCOL_VERSION: u16 = 2;
+pub const LOBBY_SESSION_PROTOCOL_VERSION: u16 = 3;
 pub const LOBBY_COUNTDOWN_SECONDS: u8 = 60;
 pub const LOBBY_COUNTDOWN_STEP_SECONDS: u8 = 10;
 pub const MAX_LOBBY_CONTROL_MESSAGE_BYTES: usize = 4_096;
+pub const MAX_LOBBY_CHAT_MESSAGE_BYTES: usize = 254;
 pub const MAX_LOBBY_PLAYER_NAME_BYTES: usize = 15;
 pub const MAX_GAME_NAME_BYTES: usize = 31;
 pub const MAX_WARCRAFT_PLAYERS: u8 = 24;
@@ -23,6 +24,10 @@ pub enum AgentLobbyMessage {
     },
     Ready {
         protocol_version: u16,
+    },
+    Chat {
+        protocol_version: u16,
+        message: String,
     },
 }
 
@@ -41,6 +46,14 @@ impl AgentLobbyMessage {
         }
     }
 
+    pub fn chat(message: String) -> Result<Self, LobbySessionValidationError> {
+        validate_lobby_chat_message(&message)?;
+        Ok(Self::Chat {
+            protocol_version: LOBBY_SESSION_PROTOCOL_VERSION,
+            message,
+        })
+    }
+
     pub fn validate(&self) -> Result<(), LobbySessionValidationError> {
         match self {
             Self::Join {
@@ -53,13 +66,20 @@ impl AgentLobbyMessage {
             Self::Ready { protocol_version } => {
                 validate_lobby_session_protocol_version(*protocol_version)
             }
+            Self::Chat {
+                protocol_version,
+                message,
+            } => {
+                validate_lobby_session_protocol_version(*protocol_version)?;
+                validate_lobby_chat_message(message)
+            }
         }
     }
 
     pub fn join_player_name(&self) -> Option<&str> {
         match self {
             Self::Join { player_name, .. } => Some(player_name),
-            Self::Ready { .. } => None,
+            Self::Ready { .. } | Self::Chat { .. } => None,
         }
     }
 }
@@ -79,6 +99,13 @@ pub enum ServerLobbyMessage {
         remaining_seconds: u8,
     },
     CountdownCancelled,
+    Chat {
+        from_player_id: u8,
+        message: String,
+    },
+    Notice {
+        message: String,
+    },
     Start,
     Rejected {
         code: LobbyJoinRejection,
@@ -378,6 +405,10 @@ pub enum LobbySessionValidationError {
     DuplicateRosterSlotIndex(u8),
     #[error("invalid lobby countdown value: {0} seconds")]
     InvalidCountdownSeconds(u8),
+    #[error(
+        "lobby chat message must contain 1 to {MAX_LOBBY_CHAT_MESSAGE_BYTES} UTF-8 bytes and no control characters"
+    )]
+    InvalidChatMessage,
 }
 
 pub fn validate_lobby_countdown_seconds(
@@ -390,6 +421,18 @@ pub fn validate_lobby_countdown_seconds(
         return Err(LobbySessionValidationError::InvalidCountdownSeconds(
             remaining_seconds,
         ));
+    }
+
+    Ok(())
+}
+
+pub fn validate_lobby_chat_message(message: &str) -> Result<(), LobbySessionValidationError> {
+    if message.is_empty()
+        || message.len() > MAX_LOBBY_CHAT_MESSAGE_BYTES
+        || message.contains('\0')
+        || message.chars().any(char::is_control)
+    {
+        return Err(LobbySessionValidationError::InvalidChatMessage);
     }
 
     Ok(())
@@ -568,16 +611,19 @@ mod tests {
         assert_eq!(message.join_player_name(), Some("Player#1234"));
         assert_eq!(
             serde_json::to_string(&message).expect("join should serialize"),
-            r#"{"type":"join","protocol_version":2,"player_name":"Player#1234"}"#
+            r#"{"type":"join","protocol_version":3,"player_name":"Player#1234"}"#
         );
     }
 
     #[test]
     fn validates_ready_and_countdown_control_messages() {
         let ready = AgentLobbyMessage::ready();
+        let chat = AgentLobbyMessage::chat("hello lobby".to_owned())
+            .expect("chat message should be valid");
 
         assert_eq!(ready.validate(), Ok(()));
         assert_eq!(ready.join_player_name(), None);
+        assert_eq!(chat.validate(), Ok(()));
         assert_eq!(validate_lobby_countdown_seconds(60), Ok(()));
         assert_eq!(validate_lobby_countdown_seconds(10), Ok(()));
         assert_eq!(
@@ -586,8 +632,16 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&ready).expect("ready should serialize"),
-            r#"{"type":"ready","protocol_version":2}"#
+            r#"{"type":"ready","protocol_version":3}"#
         );
+        assert_eq!(
+            serde_json::to_string(&chat).expect("chat should serialize"),
+            r#"{"type":"chat","protocol_version":3,"message":"hello lobby"}"#
+        );
+        assert!(matches!(
+            AgentLobbyMessage::chat("bad\nchat".to_owned()),
+            Err(LobbySessionValidationError::InvalidChatMessage)
+        ));
     }
 
     fn valid_catalog() -> LobbyCatalog {

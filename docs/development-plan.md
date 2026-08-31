@@ -107,8 +107,11 @@ Durată estimată: 4–8 săptămâni.
 Livrabile:
 
 - host virtual `Strajer` in slotul `HOSTBOT` si 10 sloturi umane;
+- chat lobby bidirectional intre toate sesiunile coordonate;
 - ready per client dupa verificarea hartii, countdown automat de 60 secunde si
   start autoritativ pe server cand toate sloturile umane sunt ocupate;
+- fallback `!start` pentru minimum doi jucatori conectati, activ numai dupa ce
+  toate sesiunile curente sunt ready;
 - load synchronization pentru jucatorii umani;
 - action batching, keepalive și desync detection;
 - leave/lag handling;
@@ -118,8 +121,9 @@ Criteriu de ieșire:
 
 - două instanțe Reforged joacă minimum 15 minute și produc un replay valid, repetat în 50 de cicluri consecutive.
 
-Status la 31 august 2026: host-ul virtual, ready, countdown-ul 60/50/40/30/20/10,
-anularea la leave si pachetele `COUNTDOWN_START`/`COUNTDOWN_END` sunt implementate.
+Status la 31 august 2026: host-ul virtual, chatul lobby, ready, countdown-ul
+60/50/40/30/20/10, fallback-ul `!start`, anularea la leave si pachetele
+`COUNTDOWN_START`/`COUNTDOWN_END` sunt implementate.
 Load sync uman, action batching, leave/lag in-game si replay raman blockerele
 pentru gameplay complet.
 
