@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,9 +10,12 @@ use strajer_protocol::{
 use subtle::ConstantTimeEq;
 
 use crate::lobby::{LobbyRegistry, LobbyRoom};
+use crate::map_asset::MapAsset;
 
 const DOTA_MAP_PATH: &str = "Maps\\Download\\DotA_v6_89Q.w3x";
 const DOTA_MAP_SHA1_HEX: &str = "c771ac8d7dc3665a211c2b1432672d49bfba1bcf";
+const DOTA_MAP_FILE_SIZE: u32 = 35_053_979;
+const DOTA_MAP_FILE_CRC32: u32 = 2_194_498_669;
 const DOTA_MAP_CHECKSUM: u32 = 448_311_427;
 const DOTA_MAP_WIDTH: u16 = 128;
 const DOTA_MAP_HEIGHT: u16 = 128;
@@ -21,6 +26,7 @@ pub struct AppState {
     catalog: Arc<LobbyCatalog>,
     lobby_registry: LobbyRegistry,
     join_token: Arc<Option<String>>,
+    map_assets: Arc<HashMap<String, MapAsset>>,
 }
 
 impl AppState {
@@ -51,6 +57,8 @@ impl AppState {
                 },
                 map: MapDescriptor {
                     path: DOTA_MAP_PATH.to_owned(),
+                    file_size: DOTA_MAP_FILE_SIZE,
+                    file_crc32: DOTA_MAP_FILE_CRC32,
                     sha1_hex: DOTA_MAP_SHA1_HEX.to_owned(),
                     checksum: DOTA_MAP_CHECKSUM,
                     width: DOTA_MAP_WIDTH,
@@ -62,6 +70,10 @@ impl AppState {
                 },
             }],
         };
+        Self::from_catalog(catalog)
+    }
+
+    pub(crate) fn from_catalog(catalog: LobbyCatalog) -> Result<Self, ValidationError> {
         catalog.validate()?;
 
         let lobby_registry = LobbyRegistry::from_catalog(&catalog);
@@ -69,6 +81,7 @@ impl AppState {
             catalog: Arc::new(catalog),
             lobby_registry,
             join_token: Arc::new(None),
+            map_assets: Arc::new(HashMap::new()),
         })
     }
 
@@ -79,6 +92,20 @@ impl AppState {
     pub fn with_join_token(mut self, join_token: Option<String>) -> Self {
         self.join_token = Arc::new(join_token);
         self
+    }
+
+    pub fn with_map_file(mut self, path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let descriptor = &self
+            .catalog
+            .lobbies
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("cannot register a map for an empty catalog"))?
+            .map;
+        let asset = MapAsset::load(descriptor, path)?;
+        let mut assets = HashMap::new();
+        assets.insert(asset.sha1_hex().to_owned(), asset);
+        self.map_assets = Arc::new(assets);
+        Ok(self)
     }
 
     pub(crate) fn authorizes_lobby_session(&self, authorization: Option<&str>) -> bool {
@@ -97,6 +124,17 @@ impl AppState {
 
     pub(crate) fn lobby_room(&self, lobby_id: &str) -> Option<Arc<LobbyRoom>> {
         self.lobby_registry.room(lobby_id)
+    }
+
+    pub(crate) fn has_required_map_assets(&self) -> bool {
+        self.catalog.lobbies.iter().all(|lobby| {
+            self.map_assets
+                .contains_key(&lobby.map.sha1_hex.to_ascii_lowercase())
+        })
+    }
+
+    pub(crate) fn map_asset(&self, sha1_hex: &str) -> Option<MapAsset> {
+        self.map_assets.get(&sha1_hex.to_ascii_lowercase()).cloned()
     }
 }
 

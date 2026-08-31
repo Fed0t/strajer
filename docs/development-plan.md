@@ -80,6 +80,8 @@ Livrabile:
 - actor per lobby și actor per player;
 - slot management, profile și skins Reforged;
 - `SLOTINFOJOIN`, `PLAYERINFO`, `MAPCHECK` și map availability;
+- endpoint de hartă autentificat, cache local atomic și map transfer W3GS cu
+  sliding window;
 - propagarea player count-ului în recordurile LAN;
 - disconnect și cleanup determinist.
 
@@ -89,9 +91,12 @@ Criteriu de ieșire:
 
 Status la 31 august 2026: serverul alocă determinist player ID și slot, iar
 agentul emite `SLOTINFOJOIN`, `PLAYERINFO`, profile/skins Reforged, `MAPCHECK`,
-update de roster și cleanup la leave. Fluxul a fost validat local în UI cu o a
-doua sesiune WSS sintetică. Validarea pe două Mac-uri reale rămâne blocată numai
-de deploy-ul versiunii noi a containerului public.
+update de roster și cleanup la leave. Serverul validează harta montată read-only,
+iar agentul implementează download HTTPS autentificat, cache SHA-1/CRC32 și
+transfer W3GS `STARTDOWNLOAD`/`MAPPART`. Codec-urile și pipeline-ul HTTP sunt
+validate automat; fluxul a fost validat local în UI numai cu harta deja
+instalată. Testul live pe un Mac fără hartă și validarea pe două Mac-uri rămân
+criterii deschise.
 
 ## Milestone 3 — Joc complet
 
@@ -99,7 +104,6 @@ Durată estimată: 4–8 săptămâni.
 
 Livrabile:
 
-- map transfer controlat și verificarea checksum-urilor;
 - countdown, load synchronization și start;
 - action batching, keepalive și desync detection;
 - leave/lag handling;

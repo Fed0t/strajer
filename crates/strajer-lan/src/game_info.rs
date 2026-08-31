@@ -223,6 +223,8 @@ mod tests {
             },
             map: MapDescriptor {
                 path: "Maps\\Strajer\\Synthetic.w3x".to_owned(),
+                file_size: 1,
+                file_crc32: 0,
                 sha1_hex: "00".repeat(20),
                 checksum: u32::MAX,
                 width: 0,

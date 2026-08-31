@@ -15,7 +15,9 @@ pub use control::{
 };
 pub use frame::{FRAME_HEADER_LENGTH, Frame, FrameError, FrameHeader, FrameReader, W3GS_SIGNATURE};
 pub use map::{
-    MAP_CHECK_PACKET_ID, MAP_SIZE_PACKET_ID, MapCheck, MapCheckError, MapSize, MapSizeError,
+    MAP_CHECK_PACKET_ID, MAP_PART_DATA_BYTES, MAP_PART_NOT_OK_PACKET_ID, MAP_PART_OK_PACKET_ID,
+    MAP_PART_PACKET_ID, MAP_SIZE_PACKET_ID, MapCheck, MapCheckError, MapPartAck, MapSize,
+    MapSizeError, MapTransferError, START_DOWNLOAD_PACKET_ID, map_part_frame, start_download_frame,
 };
 pub use player::{
     PLAYER_INFO_PACKET_ID, PLAYER_LEAVE_OTHERS_PACKET_ID, PlayerFrameError, player_info_frame,

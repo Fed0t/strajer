@@ -35,7 +35,10 @@ suportă compresia PKWare DCL folosită de arhivă.
 Pentru framing și host engine vor fi comparate independent:
 
 - [GHost++ `gameprotocol.cpp`](https://github.com/dcramer/ghostplusplus/blob/master/ghost/gameprotocol.cpp),
-  inclusiv layout-ul clasic `W3GS_REQJOIN` și generarea `SLOTINFOJOIN`;
+  inclusiv layout-ul clasic `W3GS_REQJOIN`, generarea `SLOTINFOJOIN`,
+  `STARTDOWNLOAD` și `MAPPART`;
+- [GHost++ `game_base.cpp`](https://github.com/dcramer/ghostplusplus/blob/master/ghost/game_base.cpp),
+  pentru semantica `MAPSIZE` și fereastra de 100 fragmente × 1.442 bytes;
 - [ghostpp-rs](https://github.com/Fatorin/ghostpp-rs), Apache-2.0, ca referință
   pentru framing și modelul actor;
 - [gowarcraft3 W3GS client](https://github.com/nielsAD/gowarcraft3/blob/master/cmd/w3gsclient/main.go),

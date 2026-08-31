@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CATALOG_SCHEMA_VERSION: u16 = 1;
+pub const CATALOG_SCHEMA_VERSION: u16 = 2;
 pub const DEFAULT_WARCRAFT_PRODUCT: &str = "W3XP";
 pub const DEFAULT_WARCRAFT_VERSION: &str = "2.0.4.23745";
 pub const LOBBY_SESSION_PROTOCOL_VERSION: u16 = 1;
@@ -238,6 +238,8 @@ impl WarcraftDescriptor {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MapDescriptor {
     pub path: String,
+    pub file_size: u32,
+    pub file_crc32: u32,
     pub sha1_hex: String,
     pub checksum: u32,
     pub width: u16,
@@ -248,6 +250,10 @@ impl MapDescriptor {
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.path.is_empty() || self.path.contains('\0') {
             return Err(ValidationError::InvalidMapPath);
+        }
+
+        if self.file_size == 0 {
+            return Err(ValidationError::InvalidMapFileSize);
         }
 
         self.sha1_bytes()?;
@@ -303,6 +309,8 @@ pub enum ValidationError {
     InvalidWarcraftVersion,
     #[error("map path must not be empty or contain a NUL byte")]
     InvalidMapPath,
+    #[error("map file size must not be zero")]
+    InvalidMapFileSize,
     #[error("map SHA-1 must contain exactly 40 hexadecimal characters")]
     InvalidMapSha1,
     #[error("invalid player count: {current}/{max}")]
@@ -431,6 +439,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_zero_length_map_asset() {
+        let mut catalog = valid_catalog();
+        catalog.lobbies[0].map.file_size = 0;
+
+        assert_eq!(catalog.validate(), Err(ValidationError::InvalidMapFileSize));
+    }
+
+    #[test]
     fn rejects_game_names_larger_than_the_wire_limit() {
         let mut catalog = valid_catalog();
         catalog.lobbies[0].name = "x".repeat(MAX_GAME_NAME_BYTES + 1);
@@ -517,6 +533,8 @@ mod tests {
                 },
                 map: MapDescriptor {
                     path: "Maps\\Strajer\\Synthetic.w3x".to_owned(),
+                    file_size: 1,
+                    file_crc32: 0,
                     sha1_hex: "00".repeat(20),
                     checksum: u32::MAX,
                     width: 0,

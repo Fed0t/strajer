@@ -1,5 +1,6 @@
 /target/
 /dist/
+/maps/
 /.env
 /.env.*
 !.env.example

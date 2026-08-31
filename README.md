@@ -16,12 +16,17 @@ Primul vertical slice implementează:
 - descriptor LAN verificat pentru `Maps\Download\DotA_v6_89Q.w3x`;
 - un frame reader W3GS incremental și validarea sigură a `REQJOIN`;
 - răspunsurile W3GS necesare intrării în lobby și sincronizarea live a roster-ului;
+- stocare de hartă read-only pe server, download HTTPS autentificat, cache local
+  verificat și transfer W3GS către Warcraft când harta lipsește;
 - un `Strajer.app` nativ SwiftUI cu iconiță în menu bar, status și agent Rust inclus.
 
-Intrarea în lobby și sincronizarea join/leave sunt implementate. Pornirea jocului,
-transportul action-urilor, map transfer-ul și replay-ul sunt milestone-uri
-ulterioare. Harta trebuie instalată identic pe ambele Mac-uri. Strajer nu modifică
-Warcraft III și nu publică jocuri în catalogul Battle.net.
+Intrarea în lobby, sincronizarea join/leave și pipeline-ul de map download sunt
+implementate. Pornirea jocului, transportul action-urilor și replay-ul sunt
+milestone-uri ulterioare. Harta nu mai trebuie preinstalată pe Mac: serverul o
+distribuie agentului, iar agentul o livrează către Warcraft prin protocolul W3GS.
+Validarea runtime a transferului cu Reforged pe Mac-ul fără hartă rămâne
+obligatorie înainte de a considera fluxul închis. Strajer nu modifică Warcraft III
+și nu publică jocuri în catalogul Battle.net.
 
 ## Dezvoltare locală
 
@@ -35,6 +40,8 @@ CARGO_HOME=/private/tmp/strajer-cargo-home cargo clippy --workspace --all-target
 Pornește serverul local în Docker:
 
 ```bash
+mkdir -p maps
+# Pune maps/DotA_v6_89Q.w3x înainte de pornire.
 export STRAJER_JOIN_TOKEN="$(openssl rand -hex 32)"
 docker compose up --build
 ```

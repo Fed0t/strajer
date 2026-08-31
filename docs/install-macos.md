@@ -41,4 +41,10 @@ shasum -a 256 -c Strajer-0.1.0-macos-universal.zip.sha256
 7. Ambii jucători aleg `Strajer Test #1`; după join trebuie să apară `2/11` și
    ambele nume în sloturi.
 
+Harta nu trebuie copiată manual pe al doilea Mac. Agentul verifică mai întâi o
+copie locală existentă, apoi cache-ul Strajer, iar la nevoie descarcă asset-ul
+autentificat de pe server. Warcraft primește harta prin W3GS și o salvează în
+directorul său normal `Maps/Download`. Pentru harta curentă sunt necesari circa
+35 MB liberi atât în cache-ul Strajer, cât și în directorul Warcraft.
+
 Build-ul local este semnat ad-hoc. Distribuția fără avertisment Gatekeeper necesită certificat Apple Developer ID, hardened runtime și notarizare Apple.

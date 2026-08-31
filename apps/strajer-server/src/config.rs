@@ -1,9 +1,11 @@
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
 const DEFAULT_PORT: u16 = 8_080;
+const DEFAULT_MAP_PATH: &str = "maps/DotA_v6_89Q.w3x";
 const MINIMUM_JOIN_TOKEN_BYTES: usize = 32;
 const MAXIMUM_JOIN_TOKEN_BYTES: usize = 128;
 
@@ -11,6 +13,7 @@ const MAXIMUM_JOIN_TOKEN_BYTES: usize = 128;
 pub struct ServerConfig {
     pub bind_address: SocketAddr,
     join_token: Option<String>,
+    map_path: PathBuf,
 }
 
 impl ServerConfig {
@@ -30,14 +33,29 @@ impl ServerConfig {
             bail!("STRAJER_JOIN_TOKEN is required when STRAJER_BIND_ADDR is not loopback");
         }
 
+        let map_path = read_map_path()?;
+
         Ok(Self {
             bind_address,
             join_token,
+            map_path,
         })
     }
 
     pub fn join_token(&self) -> Option<&str> {
         self.join_token.as_deref()
+    }
+
+    pub fn map_path(&self) -> &Path {
+        &self.map_path
+    }
+}
+
+fn read_map_path() -> Result<PathBuf> {
+    match env::var_os("STRAJER_MAP_PATH") {
+        Some(value) if !value.is_empty() => Ok(PathBuf::from(value)),
+        Some(_) => bail!("STRAJER_MAP_PATH must not be empty"),
+        None => Ok(PathBuf::from(DEFAULT_MAP_PATH)),
     }
 }
 

@@ -34,10 +34,11 @@ configurată înainte de orice alocare bazată pe input.
 
 ### `strajer-server`
 
-Control-plane Linux cu un catalog sintetic, registry concurent de lobby și un
-endpoint WSS autentificat. Alocă player ID-urile și sloturile, publică roster-ul
-versionat și curăță sesiunile la disconnect. Persistența și identitatea per
-instalare nu sunt încă implementate.
+Control-plane Linux cu un catalog sintetic, registry concurent de lobby, endpoint
+WSS autentificat și endpoint autentificat de map download. La boot validează
+dimensiunea, CRC32-ul și SHA-1-ul hărții montate read-only. Alocă player ID-urile
+și sloturile, publică roster-ul versionat și curăță sesiunile la disconnect.
+Persistența și identitatea per instalare nu sunt încă implementate.
 
 ### `strajer-agent`
 
@@ -45,6 +46,9 @@ Procesul de networking inclus și supravegheat de `Strajer.app`. Descarcă
 lobby-urile, deschide listener-ele locale, publică recordurile LAN, validează
 `REQJOIN`, deschide sesiunea WSS și traduce roster-ul coordonat în răspunsuri
 W3GS locale. Toate conexiunile către server sunt inițiate outbound.
+Hărțile deja instalate sunt reutilizate numai dacă trec validarea manifestului;
+altfel agentul descarcă asset-ul într-un cache atomic din
+`~/Library/Caches/Strajer/maps` și îl transferă local către Warcraft.
 
 ### `Strajer.app`
 
@@ -64,6 +68,9 @@ numărul de jocuri și detectarea unui `REQJOIN` valid. Endpoint-ul este inclus 
 7. Agentul autentifică o sesiune WSS la server, primește player ID-ul și roster-ul.
 8. Agentul răspunde local cu `SLOTINFOJOIN`, `PLAYERINFO`, profile/skins și
    `MAPCHECK`, apoi aplică update-urile de roster în lobby-ul Warcraft.
+9. Dacă Warcraft raportează harta lipsă, agentul trimite `STARTDOWNLOAD` și
+   `MAPPART` în ferestre de maximum 100 × 1.442 bytes, avansate de confirmările
+   `MAPSIZE`; fiecare fragment are CRC32 propriu.
 
 `LocalOnly` este intenționat: fiecare Mac trebuie să vadă numai proxy-ul său
 local, chiar dacă mai multe Mac-uri Strajer sunt în același LAN. Serverul Linux
@@ -74,6 +81,8 @@ rămâne singurul loc în care sesiunile celor două proxy-uri sunt reunite.
 - Milestone 0: HTTP polling pentru catalog și listener local de diagnostic.
 - Milestone 1 curent: control persistent WSS autentificat pe `443/tcp`.
 - Milestone 2 curent: registry de lobby server-side și proiecție W3GS locală.
+- Milestone 2.1 curent: distribuție HTTPS, cache verificat și map transfer W3GS;
+  validarea live pe un Mac fără hartă este încă deschisă.
 - Milestone 3: start, action loop și replay.
 - Milestone 4: QUIC pe `443/udp`, WSS fallback și reconectare măsurată.
 

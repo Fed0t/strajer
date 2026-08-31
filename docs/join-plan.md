@@ -34,6 +34,9 @@ aparține milestone-ului de gameplay.
   alocă player ID-uri și sloturi și distribuie un roster versionat.
 - Agentul trimite local `SLOTINFOJOIN`, slot info, `PLAYERINFO`, profile/skins
   Reforged și `MAPCHECK`, apoi aplică join/leave live.
+- Serverul distribuie harta printr-un endpoint HTTPS autentificat, iar agentul o
+  validează, o păstrează într-un cache atomic și implementează transferul W3GS în
+  ferestre cu backpressure bazat pe `MAPSIZE`.
 - UI-ul Warcraft a fost validat local la `2/11` cu o a doua sesiune WSS
   sintetică, apoi a revenit la `1/11` după disconnect fără slot fantomă.
 
@@ -50,9 +53,9 @@ Manifestul verificat local la 30 august 2026 este:
 - checksum Xoro al conținutului MPQ: `448311427`;
 - dimensiuni hartă: `128x128` tiles.
 
-Fișierul din repository și copia instalată local în Warcraft sunt byte-identice.
-Aceeași hartă trebuie să existe pe ambele Mac-uri la calea relativă de mai sus.
-Fișierul nu este inclus automat în Git sau în bundle-ul aplicației.
+Fișierul din directorul local `maps/` și copia instalată local în Warcraft sunt
+byte-identice. Numai serverul trebuie să aibă asset-ul înainte de pornire; harta
+nu este inclusă automat în Git, imaginea Docker sau bundle-ul aplicației.
 
 ## Arhitectura țintă
 
@@ -100,6 +103,27 @@ outbound de agent.
 - Pentru producție: QUIC pe `443/udp`, direct către container, cu câte un stream
   bidirecțional per conexiune Warcraft și WSS fallback.
 - Portul Warcraft `6112` nu este publicat și nu este forwardat în router.
+
+### Distribuția hărții
+
+- catalog schema `2` publică dimensiunea arhivei, CRC32-ul brut, SHA-1-ul și
+  checksum-ul Xoro necesare pentru `MAPCHECK`;
+- containerul montează hărțile read-only și validează asset-ul complet la boot;
+- `GET /v1/maps/{sha1}` folosește același bearer token private-beta și răspunde
+  prin streaming, fără a încărca întreaga hartă în memoria serverului;
+- agentul preferă o copie Warcraft deja validă, apoi cache-ul
+  `~/Library/Caches/Strajer/maps`, apoi download-ul HTTPS;
+- download-ul agentului este limitat la dimensiunea manifestului, verificat
+  SHA-1/CRC32 și instalat în cache prin rename atomic;
+- către Warcraft, agentul folosește `STARTDOWNLOAD` (`0x3F`) și `MAPPART`
+  (`0x43`) cu fragmente de maximum 1.442 bytes și o fereastră de 100 fragmente;
+- `MAPSIZE` cu flag `3` avansează fereastra, iar flag `1` plus dimensiunea exactă
+  închide transferul ca verificat. Timeout-urile de pregătire, progres și durată
+  totală împiedică sesiuni blocate.
+
+Codec-urile, autentificarea endpoint-ului, streaming-ul, cache-ul și fereastra de
+transfer sunt acoperite de teste. Compatibilitatea completă a secvenței cu
+Reforged `2.0.4.23745` trebuie confirmată live pe un Mac de pe care harta lipsește.
 
 WSS peste TCP este acceptabil pentru handshake și primul proof-of-concept, dar
 nu este alegerea finală pentru gameplay: pierderea unui segment exterior ar
@@ -183,10 +207,10 @@ Ordinea de implementare pentru primul lobby real:
 8. adaugă countdown, loading synchronization și action loop;
 9. adaugă leave, lag handling, desync detection și replay.
 
-Primul slice cere aceeași hartă preinstalată pe ambele Mac-uri. Map transfer-ul
-este amânat până după ce doi jucători pot intra stabil în lobby; altfel amestecă
-problemele de join, CASC, checksum și transfer într-un singur test greu de
-diagnosticat.
+Map transfer-ul este implementat ca extensie izolată peste join-ul existent:
+manifestul și cache-ul sunt separate de codec-ul W3GS, iar lipsa hărții nu mai
+oprește agentul la startup. Testul live este păstrat separat de countdown și
+action loop pentru diagnostic clar.
 
 ## Model de concurență pe server
 
@@ -277,7 +301,8 @@ join-ul lobby poate fi coordonat fără a expedia frame-ul brut.
 
 - actor de lobby și session actor;
 - `SLOTINFOJOIN`, `PLAYERINFO`, `MAPCHECK`;
-- o hartă reală preinstalată și metadata verificată;
+- o hartă reală servită de Linux și metadata verificată;
+- download HTTPS, cache local și transfer W3GS pentru clientul fără hartă;
 - cleanup complet la disconnect.
 
 Ieșire: primul Mac intră în UI-ul lobby-ului; apoi două Mac-uri se văd reciproc,
@@ -286,8 +311,10 @@ iar 50 de cicluri join/leave nu lasă sloturi sau task-uri fantomă.
 Status la 31 august 2026: single-player join și roster-ul two-player au fost
 validate în UI pe un Mac, folosind o a doua sesiune WSS reală către serverul
 local. Testele automate validează două sesiuni, player IDs distincte și cleanup
-protejat împotriva disconnect-urilor stale. Testul pe două Mac-uri și cele 50 de
-cicluri rămân criterii deschise.
+protejat împotriva disconnect-urilor stale. Pipeline-ul de map download este
+implementat și testat automat, dar secvența completă trebuie încă validată în UI
+pe Mac-ul fără hartă. Testul pe două Mac-uri și cele 50 de cicluri rămân criterii
+deschise.
 
 ### J3 — Start și gameplay, 2–4 săptămâni
 
@@ -315,8 +342,10 @@ wire protocol-ul Reforged curent și implementările W3GS clasice disponibile pu
 2. endpoint WSS bounded și autentificat — implementat;
 3. registry server-side, player IDs, sloturi și cleanup — implementate;
 4. `SLOTINFOJOIN`, `PLAYERINFO`, profile/skins, `MAPCHECK` și roster live — implementate;
-5. deploy public și validare simultană pe două Mac-uri — următorul gate;
-6. countdown, load sync și data-plane de gameplay — etapa următoare.
+5. endpoint de hartă, cache verificat și transfer W3GS — implementate, validarea
+   live pe client fără hartă este următorul gate;
+6. deploy public și validare simultană pe două Mac-uri — după gate-ul de hartă;
+7. countdown, load sync și data-plane de gameplay — etapa următoare.
 
 ## Surse de interoperabilitate
 

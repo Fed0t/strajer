@@ -3,10 +3,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use axum::Json;
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, X_CONTENT_TYPE_OPTIONS,
+};
 use axum::response::Response;
 use axum::routing::get;
 use axum::{Router, http::StatusCode};
@@ -17,8 +20,9 @@ use strajer_protocol::{
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
+use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::AppState;
 use crate::lobby::{LobbyJoinError, LobbyMembership, LobbyRoom};
@@ -38,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(readiness))
         .route("/v1/lobbies", get(lobbies))
         .route("/v1/lobbies/{lobby_id}/session", get(lobby_session))
+        .route("/v1/maps/{sha1_hex}", get(map_download))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -51,7 +56,7 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
-    let status = if state.catalog().validate().is_ok() {
+    let status = if state.catalog().validate().is_ok() && state.has_required_map_assets() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -73,6 +78,39 @@ async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<HealthRes
 
 async fn lobbies(State(state): State<AppState>) -> Json<LobbyCatalog> {
     Json(state.catalog().clone())
+}
+
+async fn map_download(
+    Path(sha1_hex): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    let authorization = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if !state.authorizes_lobby_session(authorization) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let asset = state.map_asset(&sha1_hex).ok_or(StatusCode::NOT_FOUND)?;
+    let file = tokio::fs::File::open(asset.path()).await.map_err(|open_error| {
+        error!(map_sha1 = %asset.sha1_hex(), %open_error, "configured map asset could not be opened");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let body = Body::from_stream(ReaderStream::new(file));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(CONTENT_LENGTH, asset.file_size().to_string())
+        .header(ETAG, format!("\"{}\"", asset.sha1_hex()))
+        .header(CACHE_CONTROL, "private, max-age=31536000, immutable")
+        .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(body)
+        .map_err(|response_error| {
+            error!(%response_error, "could not build map download response");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn lobby_session(
@@ -230,6 +268,10 @@ fn map_join_error(error: &LobbyJoinError) -> LobbyJoinRejection {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use futures_util::{SinkExt, StreamExt};
@@ -243,6 +285,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    const TEST_JOIN_TOKEN: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    static TEST_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[tokio::test]
     async fn serves_a_valid_synthetic_catalog() {
@@ -276,6 +322,8 @@ mod tests {
             catalog.lobbies[0].map.sha1_hex,
             "c771ac8d7dc3665a211c2b1432672d49bfba1bcf"
         );
+        assert_eq!(catalog.lobbies[0].map.file_size, 35_053_979);
+        assert_eq!(catalog.lobbies[0].map.file_crc32, 2_194_498_669);
         assert_eq!(catalog.lobbies[0].map.checksum, 448_311_427);
         assert_eq!(catalog.lobbies[0].map.width, 128);
         assert_eq!(catalog.lobbies[0].map.height, 128);
@@ -284,7 +332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reports_readiness() {
+    async fn reports_not_ready_without_a_registered_map_asset() {
         let state = AppState::synthetic_at(2_000, 2).expect("state should be valid");
         let response = router(state)
             .oneshot(
@@ -296,7 +344,74 @@ mod tests {
             .await
             .expect("router should answer");
 
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn serves_the_authenticated_map_asset_with_integrity_headers() {
+        let map_path = test_map_path();
+        fs::write(&map_path, b"123456789").expect("test map should write");
+        let mut catalog = AppState::synthetic_at(2_000, 2)
+            .expect("state should be valid")
+            .catalog()
+            .clone();
+        catalog.lobbies[0].map.file_size = 9;
+        catalog.lobbies[0].map.file_crc32 = 0xCBF4_3926;
+        catalog.lobbies[0].map.sha1_hex = "f7c3bc1d808e04732adf679965ccc34ca7ae3441".to_owned();
+        let state = AppState::from_catalog(catalog)
+            .expect("test catalog should be valid")
+            .with_map_file(&map_path)
+            .expect("test map should register")
+            .with_join_token(Some(TEST_JOIN_TOKEN.to_owned()));
+        let application = router(state);
+
+        let ready = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should answer");
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        let unauthorized = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/maps/f7c3bc1d808e04732adf679965ccc34ca7ae3441")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should answer");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/maps/f7c3bc1d808e04732adf679965ccc34ca7ae3441")
+                    .header(AUTHORIZATION, format!("Bearer {TEST_JOIN_TOKEN}"))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should answer");
+
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(response.headers()[CONTENT_LENGTH], "9");
+        assert_eq!(
+            response.headers()[ETAG],
+            "\"f7c3bc1d808e04732adf679965ccc34ca7ae3441\""
+        );
+        let body = to_bytes(response.into_body(), 16)
+            .await
+            .expect("map body should be readable");
+        assert_eq!(&body[..], b"123456789");
+        fs::remove_file(map_path).expect("test map should be removed");
     }
 
     #[tokio::test]
@@ -402,5 +517,13 @@ mod tests {
             panic!("expected text control message");
         };
         serde_json::from_str(&text).expect("control message should decode")
+    }
+
+    fn test_map_path() -> PathBuf {
+        let sequence = TEST_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "strajer-http-map-{}-{sequence}.w3x",
+            std::process::id()
+        ))
     }
 }

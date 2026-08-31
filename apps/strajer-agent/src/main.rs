@@ -8,18 +8,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use local_map::LocalMapMetadata;
+use local_map::MapCache;
 use remote_lobby::RemoteLobbySession;
 use reqwest::Client;
 use serde::Serialize;
 use strajer_lan::PublishedLobby;
 use strajer_protocol::{LobbyCatalog, LobbyDescriptor, LobbyPlayer, LobbyRoster};
 use strajer_w3gs::{
-    CHAT_TO_HOST_PACKET_ID, Frame, FrameReader, LEAVE_REQUEST_PACKET_ID, MAP_SIZE_PACKET_ID,
-    MapCheck, MapSize, PONG_TO_HOST_PACKET_ID, PROTOBUF_PACKET_ID, ProtobufEnvelope, RACE_HUMAN,
+    CHAT_TO_HOST_PACKET_ID, Frame, FrameReader, LEAVE_REQUEST_PACKET_ID, MAP_PART_DATA_BYTES,
+    MAP_PART_NOT_OK_PACKET_ID, MAP_PART_OK_PACKET_ID, MAP_SIZE_PACKET_ID, MapCheck, MapPartAck,
+    MapSize, PONG_TO_HOST_PACKET_ID, PROTOBUF_PACKET_ID, ProtobufEnvelope, RACE_HUMAN,
     RACE_NIGHT_ELF, RACE_UNDEAD, ReqJoin, SlotData, SlotInfo, SlotLayout, leave_ack,
-    ping_from_host, player_info_frame, player_leave_others_frame, player_profile_frame,
-    player_skins_frame,
+    map_part_frame, ping_from_host, player_info_frame, player_leave_others_frame,
+    player_profile_frame, player_skins_frame, start_download_frame,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -34,6 +35,11 @@ const JOIN_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_INITIAL_JOIN_FRAME_BYTES: usize = 4_096;
 const MAX_LOBBY_FRAME_BYTES: usize = u16::MAX as usize;
 const LOBBY_PING_INTERVAL: Duration = Duration::from_secs(15);
+const MAP_TRANSFER_INTERVAL: Duration = Duration::from_millis(100);
+const MAP_TRANSFER_WINDOW_PARTS: u32 = 100;
+const MAP_PREPARATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAP_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+const MAP_TRANSFER_TOTAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DOTA_MAP_PATH: &str = "Maps\\Download\\DotA_v6_89Q.w3x";
 const DOTA_PLAYER_SLOTS: u8 = 11;
 const MINIMUM_JOIN_TOKEN_BYTES: usize = 32;
@@ -92,31 +98,27 @@ struct LobbySessionConfig {
     server_url: String,
     join_token: Option<String>,
     lobby: LobbyDescriptor,
-    local_map: LocalMapMetadata,
+    map_cache: MapCache,
     map_check: MapCheck,
 }
 
 impl LobbySessionConfig {
-    fn new(
-        server_url: String,
-        join_token: Option<String>,
-        lobby: LobbyDescriptor,
-        local_map: LocalMapMetadata,
-    ) -> Result<Self> {
+    fn new(server_url: String, join_token: Option<String>, lobby: LobbyDescriptor) -> Result<Self> {
         let map_sha1 = lobby.map.sha1_bytes()?;
         let map_check = MapCheck::new(
             lobby.map.path.replace('\\', "/"),
-            local_map.file_size(),
-            local_map.crc32(),
+            lobby.map.file_size,
+            lobby.map.file_crc32,
             lobby.map.checksum,
             map_sha1,
         )?;
+        let map_cache = MapCache::new(&server_url, join_token.clone(), lobby.map.clone())?;
 
         Ok(Self {
             server_url,
             join_token,
             lobby,
-            local_map,
+            map_cache,
             map_check,
         })
     }
@@ -144,6 +146,118 @@ impl LobbySessionConfig {
         }
         frames.push(self.map_check.frame()?);
         Ok(frames)
+    }
+}
+
+enum MapTransferState {
+    AwaitingStatus,
+    Preparing(PreparingMapTransfer),
+    Downloading(ActiveMapTransfer),
+    Verified,
+}
+
+struct PreparingMapTransfer {
+    task: JoinHandle<Result<Arc<[u8]>>>,
+    from_player_id: u8,
+    to_player_id: u8,
+    started_at: Instant,
+}
+
+struct ActiveMapTransfer {
+    data: Arc<[u8]>,
+    from_player_id: u8,
+    to_player_id: u8,
+    next_offset: u32,
+    acknowledged_offset: u32,
+    started_at: Instant,
+    last_progress_at: Instant,
+    last_logged_percent: u8,
+}
+
+impl ActiveMapTransfer {
+    fn new(
+        data: Arc<[u8]>,
+        from_player_id: u8,
+        to_player_id: u8,
+        expected_size: u32,
+    ) -> Result<Self> {
+        if data.len() != usize::try_from(expected_size).context("map size does not fit platform")? {
+            bail!(
+                "prepared map contains {} bytes, expected {expected_size}",
+                data.len()
+            );
+        }
+
+        let now = Instant::now();
+        Ok(Self {
+            data,
+            from_player_id,
+            to_player_id,
+            next_offset: 0,
+            acknowledged_offset: 0,
+            started_at: now,
+            last_progress_at: now,
+            last_logged_percent: 0,
+        })
+    }
+
+    fn acknowledge(&mut self, offset: u32) -> Result<bool> {
+        let map_size = u32::try_from(self.data.len()).context("map data exceeds 4 GiB")?;
+        if offset > map_size {
+            bail!("Warcraft acknowledged map offset {offset}, but map size is {map_size}");
+        }
+        if offset <= self.acknowledged_offset {
+            return Ok(false);
+        }
+
+        self.acknowledged_offset = offset;
+        self.last_progress_at = Instant::now();
+        Ok(true)
+    }
+
+    fn pending_frames(&mut self) -> Result<Vec<Frame>> {
+        let part_size = u32::try_from(MAP_PART_DATA_BYTES).expect("map part size fits u32");
+        let window_size = part_size
+            .checked_mul(MAP_TRANSFER_WINDOW_PARTS)
+            .expect("map transfer window fits u32");
+        let window_end = self.acknowledged_offset.saturating_add(window_size);
+        let map_size = u32::try_from(self.data.len()).context("map data exceeds 4 GiB")?;
+        let mut frames = Vec::with_capacity(MAP_TRANSFER_WINDOW_PARTS as usize);
+
+        while self.next_offset < map_size && self.next_offset < window_end {
+            let start =
+                usize::try_from(self.next_offset).context("map offset does not fit usize")?;
+            let end = start
+                .saturating_add(MAP_PART_DATA_BYTES)
+                .min(self.data.len());
+            frames.push(map_part_frame(
+                self.from_player_id,
+                self.to_player_id,
+                self.next_offset,
+                &self.data[start..end],
+            )?);
+            self.next_offset = u32::try_from(end).context("map offset exceeds 4 GiB")?;
+        }
+
+        Ok(frames)
+    }
+
+    fn progress_percent(&self) -> u8 {
+        let map_size = self.data.len() as u64;
+        if map_size == 0 {
+            return 0;
+        }
+        ((u64::from(self.acknowledged_offset) * 100) / map_size) as u8
+    }
+
+    fn should_log_progress(&mut self) -> bool {
+        let percent = self.progress_percent();
+        if percent < self.last_logged_percent.saturating_add(10) && percent != 100 {
+            return false;
+        }
+
+        self.last_logged_percent = percent;
+        true
     }
 }
 
@@ -214,13 +328,10 @@ async fn activate_lobby(
     join_token: Option<String>,
     lobby: LobbyDescriptor,
 ) -> Result<(PublishedLobby, JoinHandle<Result<()>>)> {
-    let local_map = LocalMapMetadata::load(&lobby.map)
-        .with_context(|| format!("could not prepare map for lobby {}", lobby.id))?;
     let session_config = Arc::new(LobbySessionConfig::new(
         server_url,
         join_token,
         lobby.clone(),
-        local_map,
     )?);
     let listener = TcpListener::bind(("0.0.0.0", 0))
         .await
@@ -236,10 +347,21 @@ async fn activate_lobby(
         lobby_id = %lobby.id,
         game_name = %lobby.name,
         local_port = local_address.port(),
-        map_size = session_config.local_map.file_size(),
-        map_crc32 = session_config.local_map.crc32(),
+        map_size = session_config.map_cache.file_size(),
+        map_crc32 = session_config.map_cache.file_crc32(),
         "published Warcraft LAN lobby"
     );
+
+    let prefetch_config = Arc::clone(&session_config);
+    tokio::spawn(async move {
+        if let Err(error) = prefetch_config.map_cache.load().await {
+            warn!(
+                lobby_id = %prefetch_config.lobby.id,
+                %error,
+                "map prefetch failed; the agent will retry if Warcraft requests the map"
+            );
+        }
+    });
 
     let listener_task = tokio::spawn(accept_connections(session_config, listener));
     Ok((publisher, listener_task))
@@ -380,7 +502,17 @@ async fn run_lobby_session(
         session_started_at + LOBBY_PING_INTERVAL,
         LOBBY_PING_INTERVAL,
     );
-    let mut map_verified = false;
+    let mut map_transfer_interval = interval_at(
+        session_started_at + MAP_TRANSFER_INTERVAL,
+        MAP_TRANSFER_INTERVAL,
+    );
+    let map_host_player_id = roster
+        .players
+        .iter()
+        .map(|player| player.player_id)
+        .min()
+        .unwrap_or(assigned_player_id);
+    let mut map_transfer = MapTransferState::AwaitingStatus;
 
     loop {
         tokio::select! {
@@ -390,7 +522,16 @@ async fn run_lobby_session(
                     return Ok(());
                 };
 
-                if handle_lobby_frame(&config, &mut stream, frame, &mut map_verified).await? {
+                if handle_lobby_frame(
+                    &config,
+                    &mut stream,
+                    frame,
+                    &mut map_transfer,
+                    map_host_player_id,
+                    assigned_player_id,
+                )
+                .await?
+                {
                     return Ok(());
                 }
             }
@@ -399,6 +540,9 @@ async fn run_lobby_session(
                     .unwrap_or(u32::MAX);
                 let frame = ping_from_host(elapsed_millis)?;
                 write_frame(&mut stream, &frame).await?;
+            }
+            _ = map_transfer_interval.tick() => {
+                advance_map_transfer(&config, &mut stream, &mut map_transfer).await?;
             }
             roster_update = remote_session.next_roster() => {
                 let Some(next_roster) = roster_update? else {
@@ -484,11 +628,43 @@ async fn handle_lobby_frame(
     config: &LobbySessionConfig,
     stream: &mut TcpStream,
     frame: Frame,
-    map_verified: &mut bool,
+    map_transfer: &mut MapTransferState,
+    map_host_player_id: u8,
+    assigned_player_id: u8,
 ) -> Result<bool> {
     match frame.packet_id() {
         MAP_SIZE_PACKET_ID => {
-            handle_map_size(config, &frame, map_verified)?;
+            handle_map_size(
+                config,
+                stream,
+                &frame,
+                map_transfer,
+                map_host_player_id,
+                assigned_player_id,
+            )
+            .await?;
+        }
+        MAP_PART_OK_PACKET_ID => match MapPartAck::decode(&frame) {
+            Ok(acknowledgement) => {
+                debug!(
+                    lobby_id = %config.lobby.id,
+                    sender_player_id = acknowledgement.sender_player_id(),
+                    receiver_player_id = acknowledgement.receiver_player_id(),
+                    map_offset = acknowledgement.map_size(),
+                    "received W3GS map part acknowledgement"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    lobby_id = %config.lobby.id,
+                    frame_length = frame.encoded_length(),
+                    %error,
+                    "ignored an unrecognized W3GS map part acknowledgement"
+                );
+            }
+        },
+        MAP_PART_NOT_OK_PACKET_ID => {
+            bail!("Warcraft rejected a W3GS map part");
         }
         PROTOBUF_PACKET_ID => {
             let envelope = ProtobufEnvelope::decode(&frame)?;
@@ -530,34 +706,134 @@ async fn handle_lobby_frame(
     Ok(false)
 }
 
-fn handle_map_size(
+async fn handle_map_size(
     config: &LobbySessionConfig,
+    stream: &mut TcpStream,
     frame: &Frame,
-    map_verified: &mut bool,
+    map_transfer: &mut MapTransferState,
+    map_host_player_id: u8,
+    assigned_player_id: u8,
 ) -> Result<()> {
     let map_size = MapSize::decode(frame)?;
-    if !map_size.has_map() {
-        bail!("Warcraft reported that the required map is missing");
+    let expected_size = config.map_cache.file_size();
+    if map_size.has_map() && map_size.map_size() == expected_size {
+        if let MapTransferState::Preparing(preparing) = map_transfer {
+            preparing.task.abort();
+        }
+        let was_verified = matches!(map_transfer, MapTransferState::Verified);
+        *map_transfer = MapTransferState::Verified;
+        if !was_verified {
+            info!(
+                lobby_id = %config.lobby.id,
+                map_size = map_size.map_size(),
+                "Warcraft entered the local lobby with the verified map"
+            );
+            emit_status_event(&AgentStatusEvent::lobby_joined(&config.lobby.id))?;
+        }
+        return Ok(());
     }
 
-    if map_size.map_size() != config.local_map.file_size() {
+    if map_size.map_size() > expected_size {
         bail!(
-            "Warcraft reported map size {}, expected {}",
-            map_size.map_size(),
-            config.local_map.file_size()
+            "Warcraft reported map offset {}, but expected map size is {expected_size}",
+            map_size.map_size()
+        );
+    }
+    if !map_size.has_map() && !map_size.continues_download() {
+        bail!(
+            "Warcraft reported unsupported W3GS map size flag {}",
+            map_size.size_flag()
         );
     }
 
-    if !*map_verified {
-        *map_verified = true;
+    match map_transfer {
+        MapTransferState::AwaitingStatus => {
+            let map_cache = config.map_cache.clone();
+            let task = tokio::spawn(async move { map_cache.load().await });
+            write_frame(stream, &start_download_frame(map_host_player_id)?).await?;
+            *map_transfer = MapTransferState::Preparing(PreparingMapTransfer {
+                task,
+                from_player_id: map_host_player_id,
+                to_player_id: assigned_player_id,
+                started_at: Instant::now(),
+            });
+            info!(
+                lobby_id = %config.lobby.id,
+                reported_map_size = map_size.map_size(),
+                "Warcraft requested the map; preparing verified transfer data"
+            );
+        }
+        MapTransferState::Preparing(_) => {}
+        MapTransferState::Downloading(transfer) => {
+            if map_size.continues_download()
+                && transfer.acknowledge(map_size.map_size())?
+                && transfer.should_log_progress()
+            {
+                info!(
+                    lobby_id = %config.lobby.id,
+                    progress_percent = transfer.progress_percent(),
+                    acknowledged_bytes = map_size.map_size(),
+                    "Warcraft map transfer progressed"
+                );
+            }
+        }
+        MapTransferState::Verified => {
+            bail!("Warcraft reported an inconsistent map state after verification");
+        }
+    }
+
+    Ok(())
+}
+
+async fn advance_map_transfer(
+    config: &LobbySessionConfig,
+    stream: &mut TcpStream,
+    state: &mut MapTransferState,
+) -> Result<()> {
+    let preparation_finished = match state {
+        MapTransferState::Preparing(preparing) => {
+            if preparing.started_at.elapsed() > MAP_PREPARATION_TIMEOUT {
+                bail!("preparing the Warcraft map transfer timed out");
+            }
+            preparing.task.is_finished()
+        }
+        _ => false,
+    };
+
+    if preparation_finished {
+        let previous = std::mem::replace(state, MapTransferState::AwaitingStatus);
+        let MapTransferState::Preparing(preparing) = previous else {
+            unreachable!("map transfer state changed while completing preparation");
+        };
+        let data = preparing
+            .task
+            .await
+            .context("map preparation task stopped unexpectedly")??;
+        *state = MapTransferState::Downloading(ActiveMapTransfer::new(
+            data,
+            preparing.from_player_id,
+            preparing.to_player_id,
+            config.map_cache.file_size(),
+        )?);
         info!(
             lobby_id = %config.lobby.id,
-            map_size = map_size.map_size(),
-            "Warcraft entered the local lobby with the verified map"
+            map_size = config.map_cache.file_size(),
+            "started local W3GS map transfer"
         );
-        emit_status_event(&AgentStatusEvent::lobby_joined(&config.lobby.id))?;
     }
 
+    let MapTransferState::Downloading(transfer) = state else {
+        return Ok(());
+    };
+    if transfer.started_at.elapsed() > MAP_TRANSFER_TOTAL_TIMEOUT {
+        bail!("Warcraft map transfer exceeded the maximum duration");
+    }
+    if transfer.last_progress_at.elapsed() > MAP_TRANSFER_STALL_TIMEOUT {
+        bail!("Warcraft map transfer stalled waiting for acknowledgement");
+    }
+
+    let frames = transfer.pending_frames()?;
+    write_frames(stream, &frames).await?;
     Ok(())
 }
 
@@ -687,7 +963,206 @@ fn write_status_event<W: Write>(writer: &mut W, event: &AgentStatusEvent) -> Res
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::routing::get;
+    use strajer_protocol::{
+        DEFAULT_WARCRAFT_PRODUCT, DEFAULT_WARCRAFT_VERSION, MapDescriptor, PlayerCount,
+        WarcraftDescriptor,
+    };
+
     use super::*;
+
+    static MAP_FLOW_TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[tokio::test]
+    async fn downloads_and_transfers_a_missing_map_without_a_warcraft_copy() {
+        let http_listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("map fixture server should bind");
+        let http_address = http_listener
+            .local_addr()
+            .expect("map fixture address should be available");
+        let map_sha1 = "f7c3bc1d808e04732adf679965ccc34ca7ae3441";
+        let application = Router::new().route(
+            "/v1/maps/f7c3bc1d808e04732adf679965ccc34ca7ae3441",
+            get(test_map_asset),
+        );
+        let http_task = tokio::spawn(async move {
+            axum::serve(http_listener, application)
+                .await
+                .expect("map fixture server should run");
+        });
+
+        let test_directory = map_flow_test_directory();
+        let map = MapDescriptor {
+            path: DOTA_MAP_PATH.to_owned(),
+            file_size: 9,
+            file_crc32: 0xCBF4_3926,
+            sha1_hex: map_sha1.to_owned(),
+            checksum: 448_311_427,
+            width: 128,
+            height: 128,
+        };
+        let map_cache = MapCache::for_test(
+            map.clone(),
+            test_directory.join("maps").join(format!("{map_sha1}.w3x")),
+            &format!("http://{http_address}/v1/maps/{map_sha1}"),
+        )
+        .expect("test map cache should build");
+        let map_check = MapCheck::new(
+            map.path.replace('\\', "/"),
+            map.file_size,
+            map.file_crc32,
+            map.checksum,
+            map.sha1_bytes().expect("test SHA-1 should decode"),
+        )
+        .expect("test map check should build");
+        let config = LobbySessionConfig {
+            server_url: format!("http://{http_address}"),
+            join_token: None,
+            lobby: LobbyDescriptor {
+                id: "synthetic-1".to_owned(),
+                revision: 1,
+                lan_game_id: 1,
+                game_secret: 0x5354_524A,
+                name: "Strajer Test #1".to_owned(),
+                created_at_unix_seconds: 1,
+                warcraft: WarcraftDescriptor {
+                    version: DEFAULT_WARCRAFT_VERSION.to_owned(),
+                    product: DEFAULT_WARCRAFT_PRODUCT.to_owned(),
+                },
+                map,
+                players: PlayerCount {
+                    current: 1,
+                    max: DOTA_PLAYER_SLOTS,
+                },
+            },
+            map_cache,
+            map_check,
+        };
+
+        let tcp_listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test W3GS listener should bind");
+        let tcp_address = tcp_listener
+            .local_addr()
+            .expect("test W3GS address should be available");
+        let client_task = tokio::spawn(async move {
+            TcpStream::connect(tcp_address)
+                .await
+                .expect("test W3GS client should connect")
+        });
+        let (mut server_stream, _) = tcp_listener
+            .accept()
+            .await
+            .expect("test W3GS server should accept");
+        let mut client_stream = client_task.await.expect("client task should finish");
+        let mut transfer = MapTransferState::AwaitingStatus;
+
+        handle_map_size(
+            &config,
+            &mut server_stream,
+            &test_map_size_frame(1, 0),
+            &mut transfer,
+            1,
+            2,
+        )
+        .await
+        .expect("missing map should start a transfer");
+        let reader = FrameReader::new(4_096).expect("test frame reader should build");
+        let start = reader
+            .read_next(&mut client_stream)
+            .await
+            .expect("start download should read")
+            .expect("start download should exist");
+        assert_eq!(start.packet_id(), strajer_w3gs::START_DOWNLOAD_PACKET_ID);
+
+        let mut transfer_started = false;
+        for _ in 0..200 {
+            advance_map_transfer(&config, &mut server_stream, &mut transfer)
+                .await
+                .expect("map preparation should advance");
+            if matches!(transfer, MapTransferState::Downloading(_)) {
+                transfer_started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(transfer_started, "map preparation should complete");
+
+        let part = timeout(Duration::from_secs(1), reader.read_next(&mut client_stream))
+            .await
+            .expect("map part should arrive")
+            .expect("map part should decode")
+            .expect("map part should exist");
+        assert_eq!(part.packet_id(), strajer_w3gs::MAP_PART_PACKET_ID);
+        assert_eq!(&part.payload()[14..], b"123456789");
+
+        handle_map_size(
+            &config,
+            &mut server_stream,
+            &test_map_size_frame(3, 9),
+            &mut transfer,
+            1,
+            2,
+        )
+        .await
+        .expect("map progress should apply");
+        handle_map_size(
+            &config,
+            &mut server_stream,
+            &test_map_size_frame(1, 9),
+            &mut transfer,
+            1,
+            2,
+        )
+        .await
+        .expect("map verification should finish");
+        assert!(matches!(transfer, MapTransferState::Verified));
+        assert_eq!(
+            fs::read(test_directory.join("maps").join(format!("{map_sha1}.w3x")))
+                .expect("cached map should be readable"),
+            b"123456789"
+        );
+
+        http_task.abort();
+        fs::remove_dir_all(test_directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn limits_map_parts_to_a_hundred_packet_sliding_window() {
+        let map_size = MAP_PART_DATA_BYTES * 101;
+        let data: Arc<[u8]> = Arc::from(vec![0xA5; map_size]);
+        let mut transfer = ActiveMapTransfer::new(
+            data,
+            1,
+            2,
+            u32::try_from(map_size).expect("test map size should fit u32"),
+        )
+        .expect("map transfer should initialize");
+
+        let first_window = transfer
+            .pending_frames()
+            .expect("first window should build");
+        assert_eq!(first_window.len(), 100);
+        assert!(
+            transfer
+                .pending_frames()
+                .expect("blocked window should build")
+                .is_empty()
+        );
+
+        transfer
+            .acknowledge(u32::try_from(MAP_PART_DATA_BYTES).expect("part size should fit u32"))
+            .expect("acknowledgement should apply");
+        let second_window = transfer.pending_frames().expect("next window should build");
+        assert_eq!(second_window.len(), 1);
+    }
 
     #[test]
     fn writes_machine_readable_ready_status() {
@@ -714,5 +1189,25 @@ mod tests {
             String::from_utf8(output).expect("status should be UTF-8"),
             "{\"event\":\"join_request_captured\",\"lobby_id\":\"synthetic-1\"}\n"
         );
+    }
+
+    async fn test_map_asset() -> Body {
+        Body::from(&b"123456789"[..])
+    }
+
+    fn test_map_size_frame(size_flag: u8, map_size: u32) -> Frame {
+        let mut payload = Vec::with_capacity(9);
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(size_flag);
+        payload.extend_from_slice(&map_size.to_le_bytes());
+        Frame::new(MAP_SIZE_PACKET_ID, payload).expect("test map size frame should build")
+    }
+
+    fn map_flow_test_directory() -> PathBuf {
+        let sequence = MAP_FLOW_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "strajer-map-flow-{}-{sequence}",
+            std::process::id()
+        ))
     }
 }

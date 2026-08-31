@@ -29,6 +29,8 @@ async fn run_server() -> Result<()> {
     let config = ServerConfig::from_environment()?;
     let state = AppState::synthetic()
         .context("could not initialize lobby catalog")?
+        .with_map_file(config.map_path())
+        .context("could not initialize map storage")?
         .with_join_token(config.join_token().map(str::to_owned));
     let listener = TcpListener::bind(config.bind_address)
         .await

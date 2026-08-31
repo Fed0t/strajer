@@ -13,10 +13,16 @@ Copiază rezultatul o singură dată în `STRAJER_JOIN_TOKEN` din `.env`. Nu ad�
 `.env` în Git și păstrează aceeași valoare pentru build-urile macOS. Pentru
 serverul actual, configurația este:
 
+Înainte de deploy, pune harta exactă în `maps/DotA_v6_89Q.w3x`. Fișierul nu este
+inclus în imaginea Docker sau în Git; Compose montează directorul read-only în
+container. Serverul refuză să pornească dacă dimensiunea, CRC32-ul sau SHA-1-ul
+nu corespund manifestului.
+
 ```dotenv
 STRAJER_PUBLISH_ADDR=<linux-server-lan-ip>
 STRAJER_PORT=18080
 STRAJER_RUST_LOG=strajer_server=info,tower_http=info
+STRAJER_MAPS_DIR=./maps
 STRAJER_JOIN_TOKEN=<valoarea-generată>
 ```
 
@@ -31,6 +37,8 @@ curl http://<linux-server-lan-ip>:18080/v1/lobbies
 
 Catalogul nou trebuie să raporteze `"max":11`. Endpoint-ul
 `/v1/lobbies/synthetic-1/session` este WebSocket și necesită bearer token.
+Catalogul schema `2` include `file_size` și `file_crc32`; deploy-ul serverului și
+build-urile noi de client trebuie coordonate.
 
 ## Nginx Proxy Manager
 
@@ -51,6 +59,9 @@ Verificarea publică după deploy:
 ```bash
 curl https://strajer.clarixpro.com/healthz
 curl https://strajer.clarixpro.com/v1/lobbies
+curl -f -H "Authorization: Bearer ${STRAJER_JOIN_TOKEN}" \
+  -o /dev/null \
+  https://strajer.clarixpro.com/v1/maps/c771ac8d7dc3665a211c2b1432672d49bfba1bcf
 ```
 
 ## Build pentru ambele Mac-uri
