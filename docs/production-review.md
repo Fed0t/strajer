@@ -21,12 +21,14 @@ lipseste data-plane-ul W3GS care sincronizeaza efectiv jocul intre clienti.
 - ready dupa verificarea hartii, countdown autoritativ
   `60/50/40/30/20/10`, start automat la 10/10, fallback `!start` de la doi
   jucatori, anulare la leave si tranzitie spre loading;
+- coordonare idempotenta `GAMELOADED_SELF`/`GAMELOADED_OTHERS` pentru jucatorii
+  umani, cu snapshot pentru recuperarea update-urilor pierdute;
 - nickname persistent si actiunea `Nickname...` in menu bar;
 - refuz strict al unui WebUI Blizzard care nu are semnatura cunoscuta exact;
 - container Linux non-root, read-only, fara capabilitati si cu healthcheck;
 - build macOS universal `arm64` + `x86_64`, verificat prin `codesign` ad-hoc.
 
-Validarea curenta are 81 de teste Rust, testul Swift pe fixture-ul WebUI real,
+Validarea curenta are 83 de teste Rust, testul Swift pe fixture-ul WebUI real,
 `cargo clippy -D warnings`, verificarea Docker Compose, build-ul imaginii Docker
 si verificarea bundle-ului/ZIP-ului macOS.
 
@@ -34,17 +36,16 @@ si verificarea bundle-ului/ZIP-ului macOS.
 
 ### 1. Data-plane W3GS dupa loading
 
-Agentul trimite `COUNTDOWN_START`, `COUNTDOWN_END` si marcheaza host-ul virtual
-ca loaded, dar nu proceseaza inca:
+Agentul coordoneaza finalizarea loading-ului, dar nu proceseaza inca:
 
-- `GAMELOADED_SELF` si propagarea `GAMELOADED_OTHERS` pentru jucatorii reali;
 - `OUTGOING_ACTION` si ordonarea/batching-ul in `INCOMING_ACTION`/`INCOMING_ACTION2`;
 - `OUTGOING_KEEPALIVE`, checksum consensus si detectarea desync;
 - leave, lag, drop si timeout-uri in-game;
 - fluxul de replay `.w3g`.
 
-Impact: clientii pot trece din lobby in loading, dar jocul nu poate continua
-sincronizat. Acesta este blocantul principal si urmatorul milestone obligatoriu.
+Impact: clientii pot termina loading-ul coordonat, dar ceasul jocului si
+comenzile nu pot avansa sincronizat. Acesta este blocantul principal si
+urmatorul milestone obligatoriu.
 
 Solutia recomandata: actor autoritativ per joc pe server, cu un canal binar
 separat de control, cozi bounded per client, secvente monotone, tick scheduling,

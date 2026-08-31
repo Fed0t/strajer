@@ -44,6 +44,9 @@ pleacă. Chatul lobby este retransmis autoritativ tuturor jucatorilor. La 10/10
 ready countdown-ul porneste automat; pentru testele cu minimum doi jucatori,
 comanda `!start` il porneste imediat sau il armeaza pana cand toate sesiunile
 conectate confirma harta.
+In loading, serverul inregistreaza idempotent confirmarea fiecarui jucator si o
+propaga numai celorlalte sesiuni, astfel incat agentii sa emita
+`GAMELOADED_OTHERS` fara echo catre jucatorul local.
 Persistența și identitatea per instalare nu sunt încă implementate.
 
 ### `strajer-agent`
@@ -91,6 +94,8 @@ fisier necunoscut nu este suprascris. Endpoint-ul este inclus
     reproiectate pe fiecare Mac ca `W3GS_CHAT_FROM_HOST`. `!start` este o comanda
     server-side, nu un mesaj retransmis; necesita minimum doi jucatori si ready
     pentru toate sesiunile conectate.
+12. Fiecare `W3GS_GAMELOADED_SELF` devine o confirmare `loaded` server-side;
+    ceilalti agenti primesc PID-ul si emit local `W3GS_GAMELOADED_OTHERS`.
 
 `LocalOnly` este intenționat: fiecare Mac trebuie să vadă numai proxy-ul său
 local, chiar dacă mai multe Mac-uri Strajer sunt în același LAN. Serverul Linux
@@ -102,9 +107,9 @@ rămâne singurul loc în care sesiunile celor două proxy-uri sunt reunite.
 - Milestone 1 curent: control persistent WSS autentificat pe `443/tcp`.
 - Milestone 2 curent: registry de lobby server-side și proiecție W3GS locală.
 - Milestone 2.1 curent: distribuție HTTPS, cache verificat și map transfer W3GS.
-- Milestone 3 curent: host virtual, chat, ready, countdown automat/manual si
-  start spre loading.
-- Milestone 3.1: load sync uman, action loop, leave/lag si replay.
+- Milestone 3 curent: host virtual, chat, ready, countdown automat/manual, start
+  si load sync uman.
+- Milestone 3.1: action loop, leave/lag si replay.
 - Milestone 4: QUIC pe `443/udp`, WSS fallback și reconectare măsurată.
 
 HTTP polling-ul inițial este intenționat temporar; evită introducerea prematură a unui protocol de control complex înainte ca discovery-ul local să fie validat.

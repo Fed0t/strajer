@@ -1,6 +1,7 @@
 mod local_map;
 mod remote_lobby;
 
+use std::collections::HashSet;
 use std::env;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
@@ -16,13 +17,14 @@ use socket2::{Domain, Protocol, Socket, Type};
 use strajer_lan::PublishedLobby;
 use strajer_protocol::{LobbyCatalog, LobbyDescriptor, LobbyPlayer, LobbyRoster};
 use strajer_w3gs::{
-    CHAT_TO_HOST_PACKET_ID, ControlFrameError, Frame, FrameReader, LEAVE_REQUEST_PACKET_ID,
-    LobbyChatToHost, MAP_PART_DATA_BYTES, MAP_PART_NOT_OK_PACKET_ID, MAP_PART_OK_PACKET_ID,
-    MAP_SIZE_PACKET_ID, MapCheck, MapPartAck, MapSize, PONG_TO_HOST_PACKET_ID, PROTOBUF_PACKET_ID,
-    ProtobufEnvelope, RACE_HUMAN, RACE_NIGHT_ELF, RACE_UNDEAD, ReqJoin, SlotData, SlotInfo,
-    SlotLayout, chat_from_host, countdown_end, countdown_start, game_loaded_others_frame,
-    leave_ack, map_part_frame, ping_from_host, player_info_frame, player_leave_others_frame,
-    player_profile_frame, player_skins_frame, start_download_frame,
+    CHAT_TO_HOST_PACKET_ID, ControlFrameError, Frame, FrameReader, GAME_LOADED_SELF_PACKET_ID,
+    LEAVE_REQUEST_PACKET_ID, LobbyChatToHost, MAP_PART_DATA_BYTES, MAP_PART_NOT_OK_PACKET_ID,
+    MAP_PART_OK_PACKET_ID, MAP_SIZE_PACKET_ID, MapCheck, MapPartAck, MapSize,
+    PONG_TO_HOST_PACKET_ID, PROTOBUF_PACKET_ID, ProtobufEnvelope, RACE_HUMAN, RACE_NIGHT_ELF,
+    RACE_UNDEAD, ReqJoin, SlotData, SlotInfo, SlotLayout, chat_from_host, countdown_end,
+    countdown_start, game_loaded_others_frame, leave_ack, map_part_frame, ping_from_host,
+    player_info_frame, player_leave_others_frame, player_profile_frame, player_skins_frame,
+    start_download_frame, validate_game_loaded_self,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -622,6 +624,7 @@ async fn run_lobby_session(
     );
     let mut map_transfer = MapTransferState::AwaitingStatus;
     let mut game_started = false;
+    let mut loaded_remote_player_ids = HashSet::new();
 
     loop {
         tokio::select! {
@@ -638,6 +641,7 @@ async fn run_lobby_session(
                     &mut map_transfer,
                     assigned_player_id,
                     &mut remote_session,
+                    game_started,
                 )
                 .await?
                 {
@@ -741,13 +745,39 @@ async fn run_lobby_session(
                     }
                     RemoteLobbyEvent::Start => {
                         if game_started {
-                            bail!("coordinated lobby sent duplicate game start");
+                            debug!(
+                                lobby_id = %config.lobby.id,
+                                "ignored idempotent coordinated game start"
+                            );
+                            continue;
                         }
                         send_game_start(&config.lobby, &mut stream).await?;
                         game_started = true;
                         info!(
                             lobby_id = %config.lobby.id,
                             "sent W3GS game start sequence"
+                        );
+                    }
+                    RemoteLobbyEvent::PlayerLoaded { player_id } => {
+                        if !game_started {
+                            bail!("coordinated lobby reported a loaded player before game start");
+                        }
+                        if roster.player(player_id).is_none() {
+                            bail!("coordinated lobby loaded player is not in the current roster");
+                        }
+                        if !loaded_remote_player_ids.insert(player_id) {
+                            debug!(
+                                lobby_id = %config.lobby.id,
+                                player_id,
+                                "ignored idempotent remote loaded state"
+                            );
+                            continue;
+                        }
+                        write_frame(&mut stream, &game_loaded_others_frame(player_id)?).await?;
+                        info!(
+                            lobby_id = %config.lobby.id,
+                            player_id,
+                            "reported remote player as loaded to Warcraft"
                         );
                     }
                 }
@@ -846,6 +876,7 @@ async fn handle_lobby_frame(
     map_transfer: &mut MapTransferState,
     assigned_player_id: u8,
     remote_session: &mut RemoteLobbySession,
+    game_started: bool,
 ) -> Result<bool> {
     match frame.packet_id() {
         MAP_SIZE_PACKET_ID => {
@@ -898,6 +929,18 @@ async fn handle_lobby_frame(
         }
         PONG_TO_HOST_PACKET_ID => {
             debug!(lobby_id = %config.lobby.id, "received W3GS lobby pong");
+        }
+        GAME_LOADED_SELF_PACKET_ID => {
+            validate_game_loaded_self(&frame)?;
+            if !game_started {
+                bail!("Warcraft reported loading complete before coordinated game start");
+            }
+            remote_session.mark_loaded().await?;
+            info!(
+                lobby_id = %config.lobby.id,
+                player_id = assigned_player_id,
+                "Warcraft finished loading the map"
+            );
         }
         CHAT_TO_HOST_PACKET_ID => match LobbyChatToHost::decode(&frame) {
             Ok(chat) => {

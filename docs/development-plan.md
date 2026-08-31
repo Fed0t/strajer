@@ -123,9 +123,9 @@ Criteriu de ieșire:
 
 Status la 31 august 2026: host-ul virtual, chatul lobby, ready, countdown-ul
 60/50/40/30/20/10, fallback-ul `!start`, anularea la leave si pachetele
-`COUNTDOWN_START`/`COUNTDOWN_END` sunt implementate.
-Load sync uman, action batching, leave/lag in-game si replay raman blockerele
-pentru gameplay complet.
+`COUNTDOWN_START`/`COUNTDOWN_END`, `GAMELOADED_SELF` si propagarea
+`GAMELOADED_OTHERS` sunt implementate. Action batching, timeslot-urile,
+leave/lag in-game si replay raman blockerele pentru gameplay complet.
 
 ## Milestone 4 — Strajer.app
 

@@ -263,18 +263,29 @@ async fn run_connected_lobby_socket(
                     Ok(LobbyUpdate::Chat {
                         from_player_id,
                         message,
-                    }) => ServerLobbyMessage::Chat {
-                        from_player_id,
-                        message,
-                    },
+                    }) => {
+                        if from_player_id == membership.player_id {
+                            continue;
+                        }
+                        ServerLobbyMessage::Chat {
+                            from_player_id,
+                            message,
+                        }
+                    }
                     Ok(LobbyUpdate::Start) => ServerLobbyMessage::Start,
+                    Ok(LobbyUpdate::PlayerLoaded { player_id }) => {
+                        if player_id == membership.player_id {
+                            continue;
+                        }
+                        ServerLobbyMessage::PlayerLoaded { player_id }
+                    }
                     Err(broadcast::error::RecvError::Lagged(skipped_updates)) => {
                         warn!(
                             player_id = membership.player_id,
                             skipped_updates,
                             "lobby client lagged behind control updates; sending authoritative snapshot"
                         );
-                        send_lobby_control_snapshot(socket, room).await?;
+                        send_lobby_control_snapshot(socket, room, membership.player_id).await?;
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -285,7 +296,11 @@ async fn run_connected_lobby_socket(
     }
 }
 
-async fn send_lobby_control_snapshot(socket: &mut WebSocket, room: &LobbyRoom) -> Result<()> {
+async fn send_lobby_control_snapshot(
+    socket: &mut WebSocket,
+    room: &LobbyRoom,
+    recipient_player_id: u8,
+) -> Result<()> {
     let snapshot = room.control_snapshot().await;
     send_server_message(
         socket,
@@ -300,7 +315,16 @@ async fn send_lobby_control_snapshot(socket: &mut WebSocket, room: &LobbyRoom) -
         LobbyPhase::Countdown { remaining_seconds } => {
             send_server_message(socket, &ServerLobbyMessage::Countdown { remaining_seconds }).await
         }
-        LobbyPhase::Started => send_server_message(socket, &ServerLobbyMessage::Start).await,
+        LobbyPhase::Started => {
+            send_server_message(socket, &ServerLobbyMessage::Start).await?;
+            for player_id in snapshot.loaded_player_ids {
+                if player_id != recipient_player_id {
+                    send_server_message(socket, &ServerLobbyMessage::PlayerLoaded { player_id })
+                        .await?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -325,6 +349,12 @@ async fn handle_active_agent_message(
             room.mark_ready(player_id, session_id)
                 .await
                 .context("could not mark lobby player ready")?;
+            Ok(None)
+        }
+        AgentLobbyMessage::Loaded { .. } => {
+            room.mark_loaded(player_id, session_id)
+                .await
+                .context("could not mark lobby player loaded")?;
             Ok(None)
         }
         AgentLobbyMessage::Chat { message, .. } if is_manual_start_command(&message) => {
@@ -616,7 +646,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relays_lobby_chat_and_accepts_manual_start_with_two_ready_players() {
+    async fn relays_lobby_chat_without_echo_and_accepts_manual_start() {
         let (endpoint, server_task) = start_websocket_server().await;
         let mut first = connect_lobby_client(&endpoint, "First#1000").await;
         receive_joined(&mut first).await;
@@ -631,13 +661,10 @@ mod tests {
         )
         .await;
         assert_eq!(
-            receive_chat(&mut first).await,
-            (1, "hello second player".to_owned())
-        );
-        assert_eq!(
             receive_chat(&mut second).await,
             (1, "hello second player".to_owned())
         );
+        assert_no_control_message(&mut first).await;
 
         send_agent_control(
             &mut first,
@@ -750,6 +777,15 @@ mod tests {
         })
         .await
         .expect("chat should arrive")
+    }
+
+    async fn assert_no_control_message(socket: &mut TestLobbySocket) {
+        assert!(
+            timeout(Duration::from_millis(100), socket.next())
+                .await
+                .is_err(),
+            "chat sender must not receive a server echo"
+        );
     }
 
     async fn receive_notice(socket: &mut TestLobbySocket) -> String {

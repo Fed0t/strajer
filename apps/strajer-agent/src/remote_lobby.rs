@@ -30,6 +30,7 @@ pub(crate) struct RemoteLobbySession {
     maximum_players: u8,
     heartbeat_interval: Interval,
     ready_sent: bool,
+    loaded_sent: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +41,7 @@ pub(crate) enum RemoteLobbyEvent {
     Chat { from_player_id: u8, message: String },
     Notice { message: String },
     Start,
+    PlayerLoaded { player_id: u8 },
 }
 
 impl RemoteLobbySession {
@@ -92,7 +94,8 @@ impl RemoteLobbySession {
             | ServerLobbyMessage::CountdownCancelled
             | ServerLobbyMessage::Chat { .. }
             | ServerLobbyMessage::Notice { .. }
-            | ServerLobbyMessage::Start => {
+            | ServerLobbyMessage::Start
+            | ServerLobbyMessage::PlayerLoaded { .. } => {
                 bail!("coordinated lobby started control flow before join acceptance")
             }
         };
@@ -125,6 +128,7 @@ impl RemoteLobbySession {
             maximum_players: lobby.human_player_capacity(),
             heartbeat_interval,
             ready_sent: false,
+            loaded_sent: false,
         })
     }
 
@@ -150,6 +154,16 @@ impl RemoteLobbySession {
         let message =
             AgentLobbyMessage::chat(message).context("Warcraft lobby chat message is not valid")?;
         send_agent_message(&mut self.socket, &message).await
+    }
+
+    pub(crate) async fn mark_loaded(&mut self) -> Result<()> {
+        if self.loaded_sent {
+            return Ok(());
+        }
+
+        send_agent_message(&mut self.socket, &AgentLobbyMessage::loaded()).await?;
+        self.loaded_sent = true;
+        Ok(())
     }
 
     pub(crate) async fn next_event(&mut self) -> Result<Option<RemoteLobbyEvent>> {
@@ -221,6 +235,15 @@ impl RemoteLobbySession {
                 Ok(Some(RemoteLobbyEvent::Notice { message }))
             }
             ServerLobbyMessage::Start => Ok(Some(RemoteLobbyEvent::Start)),
+            ServerLobbyMessage::PlayerLoaded { player_id } => {
+                if player_id == 0
+                    || player_id > self.maximum_players
+                    || player_id == self.assigned_player_id
+                {
+                    bail!("coordinated lobby returned an invalid loaded player");
+                }
+                Ok(Some(RemoteLobbyEvent::PlayerLoaded { player_id }))
+            }
             ServerLobbyMessage::Rejected { code } => {
                 bail!("coordinated lobby rejected the active session: {code:?}")
             }

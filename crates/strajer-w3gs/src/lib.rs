@@ -22,8 +22,9 @@ pub use map::{
     MapSizeError, MapTransferError, START_DOWNLOAD_PACKET_ID, map_part_frame, start_download_frame,
 };
 pub use player::{
-    GAME_LOADED_OTHERS_PACKET_ID, PLAYER_INFO_PACKET_ID, PLAYER_LEAVE_OTHERS_PACKET_ID,
-    PlayerFrameError, game_loaded_others_frame, player_info_frame, player_leave_others_frame,
+    GAME_LOADED_OTHERS_PACKET_ID, GAME_LOADED_SELF_PACKET_ID, PLAYER_INFO_PACKET_ID,
+    PLAYER_LEAVE_OTHERS_PACKET_ID, PlayerFrameError, game_loaded_others_frame, player_info_frame,
+    player_leave_others_frame, validate_game_loaded_self,
 };
 pub use protobuf::{
     PLAYER_PROFILE_MESSAGE_TYPE, PLAYER_SKINS_MESSAGE_TYPE, PLAYER_UNKNOWN_5_MESSAGE_TYPE,

@@ -57,9 +57,10 @@ aparține milestone-ului de gameplay.
   WSS.
 
 Join-ul simultan pe doua Mac-uri este validat. Urmatorul deploy trebuie sa
-actualizeze coordonat serverul la catalog schema `3` / session protocol `3` si
+actualizeze coordonat serverul la catalog schema `3` / session protocol `4` si
 ambele aplicatii; versiunile vechi sunt refuzate intentionat. Tranzitia spre
-loading este implementata, dar data-plane-ul action-urilor nu este inca.
+loading si sincronizarea all-loaded sunt implementate, dar data-plane-ul
+action-urilor nu este inca.
 
 Manifestul verificat local la 30 august 2026 este:
 
@@ -153,15 +154,20 @@ fluxurile și păstrează transportul outbound-only.
 Control messages sunt versionate și au o limită strictă de dimensiune:
 
 ```text
-HTTP Upgrade        Authorization: Bearer <STRAJER_JOIN_TOKEN>
-Join                { protocol_version, player_name }
-Joined              { protocol_version, player_id, roster }
-Roster              { roster }
-Ready               { protocol_version }
-Countdown           { remaining_seconds }
-CountdownCancelled  {}
-Start               {}
-Rejected            { code }
+HTTP Upgrade                 Authorization: Bearer <STRAJER_JOIN_TOKEN>
+Agent -> server  Join        { protocol_version, player_name }
+Agent -> server  Ready       { protocol_version }
+Agent -> server  Chat        { protocol_version, message }
+Agent -> server  Loaded      { protocol_version }
+Server -> agent  Joined      { protocol_version, player_id, roster }
+Server -> agent  Roster      { roster }
+Server -> agent  Countdown   { remaining_seconds }
+Server -> agent  CountdownCancelled {}
+Server -> agent  Chat        { from_player_id, message }
+Server -> agent  Notice      { message }
+Server -> agent  Start       {}
+Server -> agent  PlayerLoaded { player_id }
+Server -> agent  Rejected    { code }
 ```
 
 Mesajele sunt JSON bounded la 4 KiB. W3GS rămâne între Warcraft și agent în
@@ -372,6 +378,8 @@ Decizia implementata pentru J3 este:
   porni din nou;
 - la zero, agentii trimit local `W3GS_COUNTDOWN_START`, `W3GS_COUNTDOWN_END` si
   marcheaza host-ul virtual ca loaded;
+- fiecare client raporteaza `W3GS_GAMELOADED_SELF`, iar serverul propaga PID-ul
+  catre ceilalti agenti pentru `W3GS_GAMELOADED_OTHERS`;
 - nu fortam `isHost` printr-un patch WebUI: `LobbyStart` ar apela host engine-ul
   local inexistent si ar rupe modelul autoritativ.
 
@@ -398,7 +406,8 @@ wire protocol-ul Reforged curent și implementările W3GS clasice disponibile pu
    live pe client fără hartă este următorul gate;
 6. deploy public și validare simultană pe două Mac-uri — după gate-ul de hartă;
 7. host virtual, chat, ready si countdown autoritativ automat/manual — implementate;
-8. load sync uman si data-plane de gameplay — etapa următoare.
+8. load sync uman — implementat si acoperit automat, validarea live urmeaza;
+9. data-plane de gameplay — etapa următoare.
 
 ## Surse de interoperabilitate
 

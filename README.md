@@ -23,15 +23,17 @@ Primul vertical slice implementează:
   W3GS la fiecare 10 secunde, anulare la leave și tranziție sincronă spre loading;
 - start automat la 10/10 jucatori sau fallback `!start` de la minimum doi
   jucatori conectati, dupa ce toti au terminat verificarea hartii;
+- sincronizare autoritativa `GAMELOADED_SELF`/`GAMELOADED_OTHERS` pentru
+  jucatorii umani dupa ce fiecare Warcraft termina bara de loading;
 - stocare de hartă read-only pe server, download HTTPS autentificat, cache local
   verificat și transfer W3GS către Warcraft când harta lipsește;
 - un `Strajer.app` nativ SwiftUI cu iconiță în menu bar, status, nickname persistent
   și agent Rust inclus.
 
 Intrarea în lobby, sincronizarea join/leave, pipeline-ul de map download și
-tranziția autoritativă lobby -> countdown -> loading sunt implementate.
-Transportul action-urilor, sincronizarea loading-ului uman, leave/lag in-game și
-replay-ul sunt milestone-ul următor. Harta nu mai trebuie preinstalată pe Mac: serverul o
+tranziția autoritativă lobby -> countdown -> loading -> all-loaded sunt implementate.
+Transportul action-urilor, timeslot-urile, leave/lag in-game și replay-ul sunt
+milestone-ul următor. Harta nu mai trebuie preinstalată pe Mac: serverul o
 distribuie agentului, iar agentul o livrează către Warcraft prin protocolul W3GS.
 Strajer nu modifică binarul sau arhiva CASC Warcraft III și nu publică jocuri în
 catalogul Battle.net. Pentru regresia offline Reforged, aplicația instalează un

@@ -130,6 +130,7 @@ impl LobbyRoom {
                 session_id,
                 name: player_name,
                 ready: false,
+                loaded: false,
             },
         );
         state.revision = next_revision(state.revision);
@@ -173,6 +174,30 @@ impl LobbyRoom {
         };
 
         self.spawn_countdown(countdown_generation);
+        Ok(())
+    }
+
+    pub(crate) async fn mark_loaded(
+        &self,
+        player_id: u8,
+        session_id: u64,
+    ) -> Result<(), LobbyMembershipError> {
+        let mut state = self.state.lock().await;
+        state.require_active_session(player_id, session_id)?;
+        if !state.started {
+            return Err(LobbyMembershipError::GameNotStarted);
+        }
+
+        let player = state
+            .players
+            .get_mut(&player_id)
+            .ok_or(LobbyMembershipError::UnknownSession)?;
+        if player.loaded {
+            return Ok(());
+        }
+
+        player.loaded = true;
+        let _ = self.updates.send(LobbyUpdate::PlayerLoaded { player_id });
         Ok(())
     }
 
@@ -264,6 +289,7 @@ impl LobbyRoom {
         LobbyControlSnapshot {
             roster: state.roster(),
             phase,
+            loaded_player_ids: state.loaded_player_ids(),
         }
     }
 
@@ -343,6 +369,7 @@ pub(crate) enum LobbyUpdate {
     CountdownCancelled,
     Chat { from_player_id: u8, message: String },
     Start,
+    PlayerLoaded { player_id: u8 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,6 +384,7 @@ pub(crate) enum ManualStartOutcome {
 pub(crate) struct LobbyControlSnapshot {
     pub(crate) roster: LobbyRoster,
     pub(crate) phase: LobbyPhase,
+    pub(crate) loaded_player_ids: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -384,6 +412,8 @@ pub(crate) enum LobbyJoinError {
 pub(crate) enum LobbyMembershipError {
     #[error("lobby session is no longer active")]
     UnknownSession,
+    #[error("game loading has not started")]
+    GameNotStarted,
     #[error("lobby countdown generation space is exhausted")]
     CountdownGenerationExhausted,
 }
@@ -439,6 +469,13 @@ impl LobbyRoomState {
             && !self.started
     }
 
+    fn loaded_player_ids(&self) -> Vec<u8> {
+        self.players
+            .iter()
+            .filter_map(|(&player_id, player)| player.loaded.then_some(player_id))
+            .collect()
+    }
+
     fn require_active_session(
         &self,
         player_id: u8,
@@ -460,6 +497,7 @@ struct ConnectedPlayer {
     session_id: u64,
     name: String,
     ready: bool,
+    loaded: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -713,6 +751,71 @@ mod tests {
                 .await
                 .expect("manual start request should be handled"),
             ManualStartOutcome::NotEnoughPlayers
+        );
+    }
+
+    #[tokio::test]
+    async fn publishes_each_loaded_player_once_after_start() {
+        let room = Arc::new(LobbyRoom::new_with_countdown_policy(
+            1,
+            2,
+            CountdownPolicy {
+                initial_seconds: 60,
+                step_seconds: 10,
+                tick_interval: Duration::from_millis(2),
+            },
+        ));
+        let first = room
+            .join("First#1000".to_owned())
+            .await
+            .expect("first player should join");
+        let second = room
+            .join("Second#2000".to_owned())
+            .await
+            .expect("second player should join");
+        let mut updates = first.updates.resubscribe();
+        drain_updates(&mut updates);
+
+        assert_eq!(
+            room.mark_loaded(first.player_id, first.session_id).await,
+            Err(LobbyMembershipError::GameNotStarted)
+        );
+        room.mark_ready(first.player_id, first.session_id)
+            .await
+            .expect("first player should become ready");
+        room.mark_ready(second.player_id, second.session_id)
+            .await
+            .expect("second player should become ready");
+        for _ in [60, 50, 40, 30, 20, 10] {
+            receive_update(&mut updates).await;
+        }
+        assert_eq!(receive_update(&mut updates).await, LobbyUpdate::Start);
+
+        room.mark_loaded(first.player_id, first.session_id)
+            .await
+            .expect("first loaded state should publish");
+        assert_eq!(
+            receive_update(&mut updates).await,
+            LobbyUpdate::PlayerLoaded {
+                player_id: first.player_id,
+            }
+        );
+        room.mark_loaded(first.player_id, first.session_id)
+            .await
+            .expect("duplicate loaded state should be idempotent");
+        assert!(
+            timeout(Duration::from_millis(10), updates.recv())
+                .await
+                .is_err(),
+            "duplicate loaded state must not publish"
+        );
+
+        room.mark_loaded(second.player_id, second.session_id)
+            .await
+            .expect("second loaded state should publish");
+        assert_eq!(
+            room.control_snapshot().await.loaded_player_ids,
+            vec![first.player_id, second.player_id]
         );
     }
 

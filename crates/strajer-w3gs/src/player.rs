@@ -8,6 +8,7 @@ use crate::{Frame, FrameError};
 pub const PLAYER_INFO_PACKET_ID: u8 = 0x06;
 pub const PLAYER_LEAVE_OTHERS_PACKET_ID: u8 = 0x07;
 pub const GAME_LOADED_OTHERS_PACKET_ID: u8 = 0x08;
+pub const GAME_LOADED_SELF_PACKET_ID: u8 = 0x23;
 pub const MAX_CLASSIC_PLAYER_NAME_BYTES: usize = 15;
 const PLAYER_JOIN_COUNTER: u32 = 1;
 const PLAYER_LEAVE_LOBBY_CODE: u32 = 13;
@@ -50,6 +51,19 @@ pub fn game_loaded_others_frame(player_id: u8) -> Result<Frame, PlayerFrameError
     Ok(Frame::new(GAME_LOADED_OTHERS_PACKET_ID, vec![player_id])?)
 }
 
+pub fn validate_game_loaded_self(frame: &Frame) -> Result<(), PlayerFrameError> {
+    if frame.packet_id() != GAME_LOADED_SELF_PACKET_ID {
+        return Err(PlayerFrameError::UnexpectedPacketId {
+            actual: frame.packet_id(),
+        });
+    }
+    if !frame.payload().is_empty() {
+        return Err(PlayerFrameError::InvalidGameLoadedSelfPayload);
+    }
+
+    Ok(())
+}
+
 fn validate_player(player_id: u8, player_name: &str) -> Result<(), PlayerFrameError> {
     if player_id == 0 {
         return Err(PlayerFrameError::InvalidPlayerId);
@@ -70,6 +84,10 @@ fn validate_player(player_id: u8, player_name: &str) -> Result<(), PlayerFrameEr
 
 #[derive(Debug, Error)]
 pub enum PlayerFrameError {
+    #[error("expected W3GS_GAMELOADED_SELF packet, got 0x{actual:02X}")]
+    UnexpectedPacketId { actual: u8 },
+    #[error("W3GS_GAMELOADED_SELF payload must be empty")]
+    InvalidGameLoadedSelfPayload,
     #[error("W3GS player id must not be zero")]
     InvalidPlayerId,
     #[error("W3GS player name contains {actual} bytes; expected 1 to {maximum} without NUL")]
@@ -110,6 +128,20 @@ mod tests {
         let frame = game_loaded_others_frame(11).expect("loaded frame should encode");
 
         assert_eq!(frame.to_bytes(), [0xF7, 0x08, 5, 0, 11]);
+    }
+
+    #[test]
+    fn validates_game_loaded_self() {
+        let loaded = Frame::new(GAME_LOADED_SELF_PACKET_ID, Vec::new())
+            .expect("loaded-self frame should build");
+        validate_game_loaded_self(&loaded).expect("loaded-self frame should validate");
+
+        let invalid = Frame::new(GAME_LOADED_SELF_PACKET_ID, vec![1])
+            .expect("invalid loaded-self frame should build");
+        assert!(matches!(
+            validate_game_loaded_self(&invalid),
+            Err(PlayerFrameError::InvalidGameLoadedSelfPayload)
+        ));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use thiserror::Error;
 pub const CATALOG_SCHEMA_VERSION: u16 = 3;
 pub const DEFAULT_WARCRAFT_PRODUCT: &str = "W3XP";
 pub const DEFAULT_WARCRAFT_VERSION: &str = "2.0.4.23745";
-pub const LOBBY_SESSION_PROTOCOL_VERSION: u16 = 3;
+pub const LOBBY_SESSION_PROTOCOL_VERSION: u16 = 4;
 pub const LOBBY_COUNTDOWN_SECONDS: u8 = 60;
 pub const LOBBY_COUNTDOWN_STEP_SECONDS: u8 = 10;
 pub const MAX_LOBBY_CONTROL_MESSAGE_BYTES: usize = 4_096;
@@ -23,6 +23,9 @@ pub enum AgentLobbyMessage {
         player_name: String,
     },
     Ready {
+        protocol_version: u16,
+    },
+    Loaded {
         protocol_version: u16,
     },
     Chat {
@@ -46,6 +49,12 @@ impl AgentLobbyMessage {
         }
     }
 
+    pub fn loaded() -> Self {
+        Self::Loaded {
+            protocol_version: LOBBY_SESSION_PROTOCOL_VERSION,
+        }
+    }
+
     pub fn chat(message: String) -> Result<Self, LobbySessionValidationError> {
         validate_lobby_chat_message(&message)?;
         Ok(Self::Chat {
@@ -63,7 +72,7 @@ impl AgentLobbyMessage {
                 validate_lobby_session_protocol_version(*protocol_version)?;
                 validate_lobby_player_name(player_name)
             }
-            Self::Ready { protocol_version } => {
+            Self::Ready { protocol_version } | Self::Loaded { protocol_version } => {
                 validate_lobby_session_protocol_version(*protocol_version)
             }
             Self::Chat {
@@ -79,7 +88,7 @@ impl AgentLobbyMessage {
     pub fn join_player_name(&self) -> Option<&str> {
         match self {
             Self::Join { player_name, .. } => Some(player_name),
-            Self::Ready { .. } | Self::Chat { .. } => None,
+            Self::Ready { .. } | Self::Loaded { .. } | Self::Chat { .. } => None,
         }
     }
 }
@@ -107,6 +116,9 @@ pub enum ServerLobbyMessage {
         message: String,
     },
     Start,
+    PlayerLoaded {
+        player_id: u8,
+    },
     Rejected {
         code: LobbyJoinRejection,
     },
@@ -611,18 +623,21 @@ mod tests {
         assert_eq!(message.join_player_name(), Some("Player#1234"));
         assert_eq!(
             serde_json::to_string(&message).expect("join should serialize"),
-            r#"{"type":"join","protocol_version":3,"player_name":"Player#1234"}"#
+            r#"{"type":"join","protocol_version":4,"player_name":"Player#1234"}"#
         );
     }
 
     #[test]
     fn validates_ready_and_countdown_control_messages() {
         let ready = AgentLobbyMessage::ready();
+        let loaded = AgentLobbyMessage::loaded();
         let chat = AgentLobbyMessage::chat("hello lobby".to_owned())
             .expect("chat message should be valid");
 
         assert_eq!(ready.validate(), Ok(()));
         assert_eq!(ready.join_player_name(), None);
+        assert_eq!(loaded.validate(), Ok(()));
+        assert_eq!(loaded.join_player_name(), None);
         assert_eq!(chat.validate(), Ok(()));
         assert_eq!(validate_lobby_countdown_seconds(60), Ok(()));
         assert_eq!(validate_lobby_countdown_seconds(10), Ok(()));
@@ -632,11 +647,20 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&ready).expect("ready should serialize"),
-            r#"{"type":"ready","protocol_version":3}"#
+            r#"{"type":"ready","protocol_version":4}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&loaded).expect("loaded should serialize"),
+            r#"{"type":"loaded","protocol_version":4}"#
         );
         assert_eq!(
             serde_json::to_string(&chat).expect("chat should serialize"),
-            r#"{"type":"chat","protocol_version":3,"message":"hello lobby"}"#
+            r#"{"type":"chat","protocol_version":4,"message":"hello lobby"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ServerLobbyMessage::PlayerLoaded { player_id: 2 })
+                .expect("player-loaded should serialize"),
+            r#"{"type":"player_loaded","player_id":2}"#
         );
         assert!(matches!(
             AgentLobbyMessage::chat("bad\nchat".to_owned()),
