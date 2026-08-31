@@ -54,11 +54,13 @@ Actualizat: 31 august 2026.
 
 ## Încă nevalidate
 
-- deploy-ul coordonat schema catalog `3` / session protocol `4`;
+- deploy-ul coordonat schema catalog `3` / session protocol `5`;
 - afisarea live a chatului bidirectional si validarea `!start` pe ambele Mac-uri;
 - afisarea live `Strajer` in `HOSTBOT` si countdown-ul chat pe ambele Mac-uri;
 - tranzitia live simultana a celor 10 clienti spre loading;
 - load sync uman live pe doua Mac-uri;
-- action data-plane, timeslot-uri, leave/lag handling si replay;
+- action data-plane, timeslot-uri si lifecycle in-game sunt validate automat,
+  dar nu inca intr-un joc live de 15 minute pe doua Mac-uri;
+- replay, reconnect si comportamentul sub lag real;
 - 50 de cicluri complete fara task-uri sau sloturi fantoma;
 - Developer ID signing, hardened runtime și notarizarea Apple.

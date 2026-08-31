@@ -17,8 +17,9 @@ Există trei praguri distincte:
 3. **Gameplay remote**: action-urile W3GS sunt transportate și ordonate de
    serverul autoritativ până la finalul jocului.
 
-Primele două praguri sunt implementate în vertical slice-ul curent. Al treilea
-aparține milestone-ului de gameplay.
+Toate cele trei praguri sunt implementate in vertical slice. Primele doua au
+fost validate live; gameplay-ul remote este acoperit automat si asteapta gate-ul
+live de 15 minute pe doua Mac-uri.
 
 ## Ce este deja verificat
 
@@ -57,10 +58,10 @@ aparține milestone-ului de gameplay.
   WSS.
 
 Join-ul simultan pe doua Mac-uri este validat. Urmatorul deploy trebuie sa
-actualizeze coordonat serverul la catalog schema `3` / session protocol `4` si
+actualizeze coordonat serverul la catalog schema `3` / session protocol `5` si
 ambele aplicatii; versiunile vechi sunt refuzate intentionat. Tranzitia spre
-loading si sincronizarea all-loaded sunt implementate, dar data-plane-ul
-action-urilor nu este inca.
+loading, sincronizarea all-loaded si data-plane-ul action-urilor sunt
+implementate; validarea live a action loop-ului ramane deschisa.
 
 Manifestul verificat local la 30 august 2026 este:
 
@@ -87,12 +88,11 @@ Warcraft B ─TCP local─> strajer-agent B ─outbound TLS/QUIC─┘
                                       └─ LobbyActor + W3GS host engine
 ```
 
-Agentul este un proxy W3GS local, nu host-ul final de gameplay. În slice-ul
-curent, serverul Linux deține starea lobby-ului și alocă player ID-urile și
-sloturile, iar fiecare agent generează local pachetele server-to-client care
-proiectează aceeași stare. Host engine-ul autoritativ pentru action loop rămâne
-pe server în arhitectura țintă. Toate conexiunile de Internet sunt inițiate
-outbound de agent.
+Agentul este un proxy W3GS local, nu host-ul final de gameplay. Serverul Linux
+detine starea lobby-ului, aloca player ID-urile si ruleaza action loop-ul
+autoritativ; fiecare agent proiecteaza aceeasi stare si aceleasi timeslot-uri in
+Warcraft-ul local. Toate conexiunile de Internet sunt initiate outbound de
+agent.
 
 ### Discovery local
 
@@ -115,10 +115,10 @@ outbound de agent.
 
 ### Data-plane
 
-- Pentru slice-ul curent: WSS pe `443/tcp` transportă join-ul și roster-ul,
-  deoarece funcționează prin proxy-ul existent și reduce variabilele.
-- Pentru gameplay: este necesar un data-plane binar pentru action-uri, keepalive,
-  load sync și leave; schema nu este încă fixată.
+- Pentru slice-ul curent: WSS pe `443/tcp` transporta control JSON si un
+  data-plane binar directional pentru action-uri/timeslot-uri.
+- Envelope-ul binar contine magic, protocol version `5`, tip directional,
+  sequence number `u64` si un frame W3GS de maximum 1.460 bytes.
 - Pentru producție: QUIC pe `443/udp`, direct către container, cu câte un stream
   bidirecțional per conexiune Warcraft și WSS fallback.
 - Portul Warcraft `6112` nu este publicat și nu este forwardat în router.
@@ -159,6 +159,7 @@ Agent -> server  Join        { protocol_version, player_name }
 Agent -> server  Ready       { protocol_version }
 Agent -> server  Chat        { protocol_version, message }
 Agent -> server  Loaded      { protocol_version }
+Agent -> server  Leave       { protocol_version, reason }
 Server -> agent  Joined      { protocol_version, player_id, roster }
 Server -> agent  Roster      { roster }
 Server -> agent  Countdown   { remaining_seconds }
@@ -167,12 +168,16 @@ Server -> agent  Chat        { from_player_id, message }
 Server -> agent  Notice      { message }
 Server -> agent  Start       {}
 Server -> agent  PlayerLoaded { player_id }
+Server -> agent  PlayerLeft  { player_id, reason, roster }
+Server -> agent  GameEnded   { reason }
 Server -> agent  Rejected    { code }
 ```
 
-Mesajele sunt JSON bounded la 4 KiB. W3GS rămâne între Warcraft și agent în
-acest slice; pachetele nu sunt serializate în JSON. Data-plane-ul de gameplay va
-folosi payload binar și sequence numbers sau stream-uri QUIC.
+Mesajele de control sunt JSON bounded la 4 KiB. Gameplay-ul foloseste mesaje
+WebSocket binare bounded: agentul trimite numai `OUTGOING_ACTION` si
+`OUTGOING_KEEPALIVE`, iar serverul trimite numai timeslot-uri
+`INCOMING_ACTION`/`INCOMING_ACTION2`. Fiecare directie valideaza secvente
+monotone si frame-ul W3GS inainte de procesare.
 
 Serverul acceptă numai un `lobby_id` emis de catalogul său. Protocolul nu oferă
 agentului un câmp arbitrar `host:port`, evitând transformarea Strajer într-un
@@ -234,6 +239,9 @@ Ordinea de implementare pentru primul lobby real:
 7. implementează chat si ready numai după ce join-ul de bază este stabil;
 8. adaugă team/color, countdown, loading synchronization și action loop;
 9. adaugă leave, lag handling, desync detection și replay.
+
+Pasul 8 si partea de leave/desync/cleanup din pasul 9 sunt implementate. Replay,
+reconnect si validarea live sub lag raman deschise.
 
 Map transfer-ul este implementat ca extensie izolată peste join-ul existent:
 manifestul și cache-ul sunt separate de codec-ul W3GS, iar lipsa hărții nu mai
@@ -321,9 +329,9 @@ Ieșire: `REQJOIN` de pe ambele Mac-uri ajunge byte-identic pe Linux, fără por
 forwarding pe clienți și fără posibilitatea de a selecta o destinație arbitrară.
 
 Status la 31 august 2026: WSS autentificat, limitele de mesaj, timeout-urile și
-rutarea strictă prin `lobby_id` sunt implementate pentru control/roster. Tunelul
-binar byte-identic a fost amânat până la data-plane-ul de gameplay, deoarece
-join-ul lobby poate fi coordonat fără a expedia frame-ul brut.
+rutarea strictă prin `lobby_id` sunt implementate. Protocolul `5` foloseste
+mesaje binare directionale si secvente monotone pentru frame-urile de gameplay;
+join-ul si controlul raman mesaje JSON separate.
 
 ### J2 — Lobby single-player și apoi two-player, 1–2 săptămâni
 
@@ -380,6 +388,10 @@ Decizia implementata pentru J3 este:
   marcheaza host-ul virtual ca loaded;
 - fiecare client raporteaza `W3GS_GAMELOADED_SELF`, iar serverul propaga PID-ul
   catre ceilalti agenti pentru `W3GS_GAMELOADED_OTHERS`;
+- dupa all-loaded, serverul ruleaza tick-uri de 100 ms, ordoneaza action-urile,
+  fragmenteaza timeslot-urile la limita W3GS si compara checksum-urile keepalive;
+- leave/disconnect este propagat cu reason code, iar desync-ul sau ultimul
+  jucator ramas produc game-over si cleanup determinist;
 - nu fortam `isHost` printr-un patch WebUI: `LobbyStart` ar apela host engine-ul
   local inexistent si ar rupe modelul autoritativ.
 
@@ -407,7 +419,8 @@ wire protocol-ul Reforged curent și implementările W3GS clasice disponibile pu
 6. deploy public și validare simultană pe două Mac-uri — după gate-ul de hartă;
 7. host virtual, chat, ready si countdown autoritativ automat/manual — implementate;
 8. load sync uman — implementat si acoperit automat, validarea live urmeaza;
-9. data-plane de gameplay — etapa următoare.
+9. data-plane action/timeslot, keepalive/desync si lifecycle — implementat si
+   acoperit automat; testul live de 15 minute si replay-ul urmeaza.
 
 ## Surse de interoperabilitate
 

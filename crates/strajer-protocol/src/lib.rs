@@ -1,3 +1,5 @@
+mod game_tunnel;
+
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
@@ -6,7 +8,12 @@ use thiserror::Error;
 pub const CATALOG_SCHEMA_VERSION: u16 = 3;
 pub const DEFAULT_WARCRAFT_PRODUCT: &str = "W3XP";
 pub const DEFAULT_WARCRAFT_VERSION: &str = "2.0.4.23745";
-pub const LOBBY_SESSION_PROTOCOL_VERSION: u16 = 4;
+pub use game_tunnel::{
+    AgentGameMessage, GameTunnelError, MAX_GAME_TUNNEL_MESSAGE_BYTES,
+    MAX_TUNNELED_W3GS_FRAME_BYTES, ServerGameMessage,
+};
+
+pub const LOBBY_SESSION_PROTOCOL_VERSION: u16 = 5;
 pub const LOBBY_COUNTDOWN_SECONDS: u8 = 60;
 pub const LOBBY_COUNTDOWN_STEP_SECONDS: u8 = 10;
 pub const MAX_LOBBY_CONTROL_MESSAGE_BYTES: usize = 4_096;
@@ -31,6 +38,10 @@ pub enum AgentLobbyMessage {
     Chat {
         protocol_version: u16,
         message: String,
+    },
+    Leave {
+        protocol_version: u16,
+        reason: LobbyLeaveReason,
     },
 }
 
@@ -63,6 +74,13 @@ impl AgentLobbyMessage {
         })
     }
 
+    pub fn leave(reason: LobbyLeaveReason) -> Self {
+        Self::Leave {
+            protocol_version: LOBBY_SESSION_PROTOCOL_VERSION,
+            reason,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), LobbySessionValidationError> {
         match self {
             Self::Join {
@@ -72,9 +90,11 @@ impl AgentLobbyMessage {
                 validate_lobby_session_protocol_version(*protocol_version)?;
                 validate_lobby_player_name(player_name)
             }
-            Self::Ready { protocol_version } | Self::Loaded { protocol_version } => {
-                validate_lobby_session_protocol_version(*protocol_version)
-            }
+            Self::Ready { protocol_version }
+            | Self::Loaded { protocol_version }
+            | Self::Leave {
+                protocol_version, ..
+            } => validate_lobby_session_protocol_version(*protocol_version),
             Self::Chat {
                 protocol_version,
                 message,
@@ -88,7 +108,9 @@ impl AgentLobbyMessage {
     pub fn join_player_name(&self) -> Option<&str> {
         match self {
             Self::Join { player_name, .. } => Some(player_name),
-            Self::Ready { .. } | Self::Loaded { .. } | Self::Chat { .. } => None,
+            Self::Ready { .. } | Self::Loaded { .. } | Self::Chat { .. } | Self::Leave { .. } => {
+                None
+            }
         }
     }
 }
@@ -119,9 +141,65 @@ pub enum ServerLobbyMessage {
     PlayerLoaded {
         player_id: u8,
     },
+    PlayerLeft {
+        player_id: u8,
+        reason: LobbyLeaveReason,
+        roster: LobbyRoster,
+    },
+    GameEnded {
+        reason: GameEndReason,
+    },
     Rejected {
         code: LobbyJoinRejection,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LobbyLeaveReason {
+    Disconnect,
+    Lost,
+    LostBuildings,
+    Won,
+    Draw,
+    Observer,
+    Lobby,
+}
+
+impl LobbyLeaveReason {
+    pub fn from_w3gs_code(code: u32) -> Result<Self, LobbySessionValidationError> {
+        match code {
+            0x01 => Ok(Self::Disconnect),
+            0x07 => Ok(Self::Lost),
+            0x08 => Ok(Self::LostBuildings),
+            0x09 => Ok(Self::Won),
+            0x0A => Ok(Self::Draw),
+            0x0B => Ok(Self::Observer),
+            0x0D => Ok(Self::Lobby),
+            _ => Err(LobbySessionValidationError::InvalidLeaveReason(code)),
+        }
+    }
+
+    pub fn w3gs_code(self) -> u32 {
+        match self {
+            Self::Disconnect => 0x01,
+            Self::Lost => 0x07,
+            Self::LostBuildings => 0x08,
+            Self::Won => 0x09,
+            Self::Draw => 0x0A,
+            Self::Observer => 0x0B,
+            Self::Lobby => 0x0D,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameEndReason {
+    LastPlayerStanding,
+    Desync,
+    EmptyLobby,
+    ProtocolError,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -417,6 +495,8 @@ pub enum LobbySessionValidationError {
     DuplicateRosterSlotIndex(u8),
     #[error("invalid lobby countdown value: {0} seconds")]
     InvalidCountdownSeconds(u8),
+    #[error("invalid Warcraft leave reason code: 0x{0:08X}")]
+    InvalidLeaveReason(u32),
     #[error(
         "lobby chat message must contain 1 to {MAX_LOBBY_CHAT_MESSAGE_BYTES} UTF-8 bytes and no control characters"
     )]
@@ -623,7 +703,7 @@ mod tests {
         assert_eq!(message.join_player_name(), Some("Player#1234"));
         assert_eq!(
             serde_json::to_string(&message).expect("join should serialize"),
-            r#"{"type":"join","protocol_version":4,"player_name":"Player#1234"}"#
+            r#"{"type":"join","protocol_version":5,"player_name":"Player#1234"}"#
         );
     }
 
@@ -631,6 +711,7 @@ mod tests {
     fn validates_ready_and_countdown_control_messages() {
         let ready = AgentLobbyMessage::ready();
         let loaded = AgentLobbyMessage::loaded();
+        let leave = AgentLobbyMessage::leave(LobbyLeaveReason::Lobby);
         let chat = AgentLobbyMessage::chat("hello lobby".to_owned())
             .expect("chat message should be valid");
 
@@ -638,6 +719,8 @@ mod tests {
         assert_eq!(ready.join_player_name(), None);
         assert_eq!(loaded.validate(), Ok(()));
         assert_eq!(loaded.join_player_name(), None);
+        assert_eq!(leave.validate(), Ok(()));
+        assert_eq!(leave.join_player_name(), None);
         assert_eq!(chat.validate(), Ok(()));
         assert_eq!(validate_lobby_countdown_seconds(60), Ok(()));
         assert_eq!(validate_lobby_countdown_seconds(10), Ok(()));
@@ -647,16 +730,25 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&ready).expect("ready should serialize"),
-            r#"{"type":"ready","protocol_version":4}"#
+            r#"{"type":"ready","protocol_version":5}"#
         );
         assert_eq!(
             serde_json::to_string(&loaded).expect("loaded should serialize"),
-            r#"{"type":"loaded","protocol_version":4}"#
+            r#"{"type":"loaded","protocol_version":5}"#
         );
         assert_eq!(
             serde_json::to_string(&chat).expect("chat should serialize"),
-            r#"{"type":"chat","protocol_version":4,"message":"hello lobby"}"#
+            r#"{"type":"chat","protocol_version":5,"message":"hello lobby"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&leave).expect("leave should serialize"),
+            r#"{"type":"leave","protocol_version":5,"reason":"lobby"}"#
+        );
+        assert_eq!(
+            LobbyLeaveReason::from_w3gs_code(0x0D),
+            Ok(LobbyLeaveReason::Lobby)
+        );
+        assert_eq!(LobbyLeaveReason::Lobby.w3gs_code(), 0x0D);
         assert_eq!(
             serde_json::to_string(&ServerLobbyMessage::PlayerLoaded { player_id: 2 })
                 .expect("player-loaded should serialize"),

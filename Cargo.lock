@@ -1535,6 +1535,7 @@ dependencies = [
  "serde_json",
  "sha1 0.10.7",
  "strajer-protocol",
+ "strajer-w3gs",
  "subtle",
  "thiserror",
  "tokio",

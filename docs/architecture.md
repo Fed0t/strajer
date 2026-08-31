@@ -96,6 +96,13 @@ fisier necunoscut nu este suprascris. Endpoint-ul este inclus
     pentru toate sesiunile conectate.
 12. Fiecare `W3GS_GAMELOADED_SELF` devine o confirmare `loaded` server-side;
     ceilalti agenti primesc PID-ul si emit local `W3GS_GAMELOADED_OTHERS`.
+13. Dupa all-loaded, agentii trimit `OUTGOING_ACTION` si
+    `OUTGOING_KEEPALIVE` in envelope binare WSS cu secvente monotone. Actorul
+    serverului publica timeslot-uri `INCOMING_ACTION`/`INCOMING_ACTION2` la
+    fiecare 100 ms.
+14. Leave/disconnect-ul este propagat cu reason code W3GS; desync-ul sau ultimul
+    jucator ramas inchid jocul, iar camera se reseteaza dupa cleanup-ul tuturor
+    sesiunilor.
 
 `LocalOnly` este intenționat: fiecare Mac trebuie să vadă numai proxy-ul său
 local, chiar dacă mai multe Mac-uri Strajer sunt în același LAN. Serverul Linux
@@ -107,9 +114,10 @@ rămâne singurul loc în care sesiunile celor două proxy-uri sunt reunite.
 - Milestone 1 curent: control persistent WSS autentificat pe `443/tcp`.
 - Milestone 2 curent: registry de lobby server-side și proiecție W3GS locală.
 - Milestone 2.1 curent: distribuție HTTPS, cache verificat și map transfer W3GS.
-- Milestone 3 curent: host virtual, chat, ready, countdown automat/manual, start
-  si load sync uman.
-- Milestone 3.1: action loop, leave/lag si replay.
+- Milestone 3 curent: host virtual, chat, ready, countdown automat/manual, start,
+  load sync si action loop autoritativ.
+- Milestone 3.1 curent: leave/disconnect, checksum/desync si cleanup; replay-ul si
+  validarea live/soak raman deschise.
 - Milestone 4: QUIC pe `443/udp`, WSS fallback și reconectare măsurată.
 
 HTTP polling-ul inițial este intenționat temporar; evită introducerea prematură a unui protocol de control complex înainte ca discovery-ul local să fie validat.

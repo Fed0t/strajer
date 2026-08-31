@@ -2,6 +2,7 @@
 
 mod control;
 mod frame;
+mod game;
 mod map;
 mod net;
 mod player;
@@ -16,15 +17,21 @@ pub use control::{
     chat_from_host, countdown_end, countdown_start, leave_ack, ping_from_host,
 };
 pub use frame::{FRAME_HEADER_LENGTH, Frame, FrameError, FrameHeader, FrameReader, W3GS_SIGNATURE};
+pub use game::{
+    INCOMING_ACTION_2_PACKET_ID, INCOMING_ACTION_PACKET_ID, IncomingActionFrame,
+    MAX_ACTION_DATA_BYTES, OUTGOING_ACTION_PACKET_ID, OUTGOING_KEEPALIVE_PACKET_ID, OutgoingAction,
+    OutgoingKeepAlive, PlayerAction, W3gsGameFrameError, incoming_action_frames,
+};
 pub use map::{
     MAP_CHECK_PACKET_ID, MAP_PART_DATA_BYTES, MAP_PART_NOT_OK_PACKET_ID, MAP_PART_OK_PACKET_ID,
     MAP_PART_PACKET_ID, MAP_SIZE_PACKET_ID, MapCheck, MapCheckError, MapPartAck, MapSize,
     MapSizeError, MapTransferError, START_DOWNLOAD_PACKET_ID, map_part_frame, start_download_frame,
 };
 pub use player::{
-    GAME_LOADED_OTHERS_PACKET_ID, GAME_LOADED_SELF_PACKET_ID, PLAYER_INFO_PACKET_ID,
-    PLAYER_LEAVE_OTHERS_PACKET_ID, PlayerFrameError, game_loaded_others_frame, player_info_frame,
-    player_leave_others_frame, validate_game_loaded_self,
+    GAME_LOADED_OTHERS_PACKET_ID, GAME_LOADED_SELF_PACKET_ID, GAME_OVER_PACKET_ID,
+    PLAYER_INFO_PACKET_ID, PLAYER_LEAVE_OTHERS_PACKET_ID, PlayerFrameError,
+    game_loaded_others_frame, game_over_frame, leave_request_reason, player_info_frame,
+    player_leave_others_frame, player_leave_others_frame_with_reason, validate_game_loaded_self,
 };
 pub use protobuf::{
     PLAYER_PROFILE_MESSAGE_TYPE, PLAYER_SKINS_MESSAGE_TYPE, PLAYER_UNKNOWN_5_MESSAGE_TYPE,

@@ -15,8 +15,14 @@ use axum::routing::get;
 use axum::{Router, http::StatusCode};
 use serde::Serialize;
 use strajer_protocol::{
-    AgentLobbyMessage, LOBBY_SESSION_PROTOCOL_VERSION, LobbyCatalog, LobbyJoinRejection,
-    LobbySessionValidationError, MAX_LOBBY_CONTROL_MESSAGE_BYTES, ServerLobbyMessage,
+    AgentGameMessage, AgentLobbyMessage, LOBBY_SESSION_PROTOCOL_VERSION, LobbyCatalog,
+    LobbyJoinRejection, LobbyLeaveReason, LobbySessionValidationError,
+    MAX_GAME_TUNNEL_MESSAGE_BYTES, MAX_LOBBY_CONTROL_MESSAGE_BYTES, MAX_TUNNELED_W3GS_FRAME_BYTES,
+    ServerGameMessage, ServerLobbyMessage,
+};
+use strajer_w3gs::{
+    Frame, OUTGOING_ACTION_PACKET_ID, OUTGOING_KEEPALIVE_PACKET_ID, OutgoingAction,
+    OutgoingKeepAlive, PlayerAction,
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -30,6 +36,12 @@ use crate::lobby::{
 };
 
 const LOBBY_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_LOBBY_WEBSOCKET_MESSAGE_BYTES: usize =
+    if MAX_LOBBY_CONTROL_MESSAGE_BYTES > MAX_GAME_TUNNEL_MESSAGE_BYTES {
+        MAX_LOBBY_CONTROL_MESSAGE_BYTES
+    } else {
+        MAX_GAME_TUNNEL_MESSAGE_BYTES
+    };
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -131,8 +143,8 @@ async fn lobby_session(
     let room = state.lobby_room(&lobby_id).ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(websocket
-        .max_message_size(MAX_LOBBY_CONTROL_MESSAGE_BYTES)
-        .max_frame_size(MAX_LOBBY_CONTROL_MESSAGE_BYTES)
+        .max_message_size(MAX_LOBBY_WEBSOCKET_MESSAGE_BYTES)
+        .max_frame_size(MAX_LOBBY_WEBSOCKET_MESSAGE_BYTES)
         .on_upgrade(move |socket| serve_lobby_socket(socket, room, lobby_id)))
 }
 
@@ -184,7 +196,12 @@ async fn serve_lobby_socket(mut socket: WebSocket, room: Arc<LobbyRoom>, lobby_i
         warn!(%lobby_id, player_id, %error, "coordinated lobby socket ended with an error");
     }
 
-    room.leave(player_id, session_id).await;
+    if let Err(error) = room
+        .leave(player_id, session_id, LobbyLeaveReason::Disconnect)
+        .await
+    {
+        warn!(%lobby_id, player_id, %error, "could not clean up coordinated lobby membership");
+    }
     info!(%lobby_id, player_id, "player left coordinated lobby");
 }
 
@@ -245,20 +262,26 @@ async fn run_connected_lobby_socket(
                             send_server_message(socket, &response).await?;
                         }
                     }
-                    Some(Ok(Message::Binary(_))) => {
-                        bail!("unexpected binary client message after lobby join");
+                    Some(Ok(Message::Binary(payload))) => {
+                        handle_active_agent_game_message(
+                            room,
+                            membership.player_id,
+                            membership.session_id,
+                            &payload,
+                        )
+                        .await?;
                     }
                     Some(Err(error)) => return Err(error).context("could not read lobby WebSocket"),
                 }
             }
             update = membership.updates.recv() => {
                 let message = match update {
-                    Ok(LobbyUpdate::Roster(roster)) => ServerLobbyMessage::Roster { roster },
+                    Ok(LobbyUpdate::Roster(roster)) => Some(ServerLobbyMessage::Roster { roster }),
                     Ok(LobbyUpdate::Countdown { remaining_seconds }) => {
-                        ServerLobbyMessage::Countdown { remaining_seconds }
+                        Some(ServerLobbyMessage::Countdown { remaining_seconds })
                     }
                     Ok(LobbyUpdate::CountdownCancelled) => {
-                        ServerLobbyMessage::CountdownCancelled
+                        Some(ServerLobbyMessage::CountdownCancelled)
                     }
                     Ok(LobbyUpdate::Chat {
                         from_player_id,
@@ -267,17 +290,34 @@ async fn run_connected_lobby_socket(
                         if from_player_id == membership.player_id {
                             continue;
                         }
-                        ServerLobbyMessage::Chat {
+                        Some(ServerLobbyMessage::Chat {
                             from_player_id,
                             message,
-                        }
+                        })
                     }
-                    Ok(LobbyUpdate::Start) => ServerLobbyMessage::Start,
+                    Ok(LobbyUpdate::Start) => Some(ServerLobbyMessage::Start),
                     Ok(LobbyUpdate::PlayerLoaded { player_id }) => {
                         if player_id == membership.player_id {
                             continue;
                         }
-                        ServerLobbyMessage::PlayerLoaded { player_id }
+                        Some(ServerLobbyMessage::PlayerLoaded { player_id })
+                    }
+                    Ok(LobbyUpdate::PlayerLeft {
+                        player_id,
+                        reason,
+                        roster,
+                    }) => Some(ServerLobbyMessage::PlayerLeft {
+                        player_id,
+                        reason,
+                        roster,
+                    }),
+                    Ok(LobbyUpdate::GameFrame { sequence, frame }) => {
+                        send_server_game_message(socket, sequence, frame).await?;
+                        None
+                    }
+                    Ok(LobbyUpdate::GameEnded { reason }) => {
+                        send_server_message(socket, &ServerLobbyMessage::GameEnded { reason }).await?;
+                        return Ok(());
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped_updates)) => {
                         warn!(
@@ -290,7 +330,9 @@ async fn run_connected_lobby_socket(
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 };
-                send_server_message(socket, &message).await?;
+                if let Some(message) = message {
+                    send_server_message(socket, &message).await?;
+                }
             }
         }
     }
@@ -315,7 +357,7 @@ async fn send_lobby_control_snapshot(
         LobbyPhase::Countdown { remaining_seconds } => {
             send_server_message(socket, &ServerLobbyMessage::Countdown { remaining_seconds }).await
         }
-        LobbyPhase::Started => {
+        LobbyPhase::Loading => {
             send_server_message(socket, &ServerLobbyMessage::Start).await?;
             for player_id in snapshot.loaded_player_ids {
                 if player_id != recipient_player_id {
@@ -324,6 +366,9 @@ async fn send_lobby_control_snapshot(
                 }
             }
             Ok(())
+        }
+        LobbyPhase::Playing | LobbyPhase::Ended => {
+            bail!("cannot recover a lagged authoritative gameplay stream")
         }
     }
 }
@@ -370,7 +415,50 @@ async fn handle_active_agent_message(
                 .context("could not publish lobby chat")?;
             Ok(None)
         }
+        AgentLobbyMessage::Leave { reason, .. } => {
+            room.leave(player_id, session_id, reason)
+                .await
+                .context("could not remove lobby player")?;
+            Ok(None)
+        }
         AgentLobbyMessage::Join { .. } => bail!("duplicate lobby join message"),
+    }
+}
+
+async fn handle_active_agent_game_message(
+    room: &Arc<LobbyRoom>,
+    player_id: u8,
+    session_id: u64,
+    payload: &[u8],
+) -> Result<()> {
+    if payload.len() > MAX_GAME_TUNNEL_MESSAGE_BYTES {
+        bail!("lobby client gameplay message exceeds configured limit");
+    }
+
+    let message = AgentGameMessage::decode(payload)
+        .context("could not decode active lobby gameplay message")?;
+    let sequence = message.sequence();
+    let frame = Frame::decode_exact(message.frame(), MAX_TUNNELED_W3GS_FRAME_BYTES)
+        .context("could not decode tunneled W3GS gameplay frame")?;
+
+    match frame.packet_id() {
+        OUTGOING_ACTION_PACKET_ID => {
+            let outgoing = OutgoingAction::decode(&frame)
+                .context("could not decode tunneled W3GS outgoing action")?;
+            let action = PlayerAction::new(player_id, outgoing.data().to_vec())
+                .context("could not authenticate tunneled W3GS outgoing action")?;
+            room.submit_action(player_id, session_id, sequence, action)
+                .await
+                .context("could not enqueue tunneled W3GS outgoing action")
+        }
+        OUTGOING_KEEPALIVE_PACKET_ID => {
+            let keepalive = OutgoingKeepAlive::decode(&frame)
+                .context("could not decode tunneled W3GS keepalive")?;
+            room.submit_keepalive(player_id, session_id, sequence, keepalive.checksum())
+                .await
+                .context("could not enqueue tunneled W3GS keepalive")
+        }
+        packet_id => bail!("unsupported tunneled agent W3GS packet 0x{packet_id:02X}"),
     }
 }
 
@@ -406,6 +494,20 @@ async fn send_server_message(socket: &mut WebSocket, message: &ServerLobbyMessag
         .send(Message::Text(text.into()))
         .await
         .context("could not send lobby control message")
+}
+
+async fn send_server_game_message(
+    socket: &mut WebSocket,
+    sequence: u64,
+    frame: Vec<u8>,
+) -> Result<()> {
+    let message = ServerGameMessage::w3gs_frame(sequence, frame)
+        .context("could not encode lobby gameplay message")?;
+    let payload = message.encode();
+    socket
+        .send(Message::Binary(payload.into()))
+        .await
+        .context("could not send lobby gameplay message")
 }
 
 fn map_validation_error(error: LobbySessionValidationError) -> LobbyJoinRejection {

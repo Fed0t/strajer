@@ -1,16 +1,22 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use strajer_protocol::{
-    LOBBY_COUNTDOWN_SECONDS, LOBBY_COUNTDOWN_STEP_SECONDS, LobbyCatalog, LobbyPlayer, LobbyRoster,
+    GameEndReason, LOBBY_COUNTDOWN_SECONDS, LOBBY_COUNTDOWN_STEP_SECONDS, LobbyCatalog,
+    LobbyLeaveReason, LobbyPlayer, LobbyRoster,
 };
+use strajer_w3gs::{PlayerAction, incoming_action_frames};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
-use tokio::time::sleep;
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
+use tracing::error;
 
-const LOBBY_UPDATE_CAPACITY: usize = 64;
+const LOBBY_UPDATE_CAPACITY: usize = 512;
 const MINIMUM_MANUAL_START_PLAYERS: usize = 2;
+const MAX_PENDING_GAME_ACTIONS: usize = 512;
+const MAX_PENDING_GAME_ACTION_BYTES: usize = 512 * 1_452;
+const MAX_PENDING_CHECKSUMS_PER_PLAYER: usize = 64;
 
 #[derive(Clone)]
 pub(crate) struct LobbyRegistry {
@@ -46,6 +52,7 @@ impl LobbyRegistry {
 pub(crate) struct LobbyRoom {
     maximum_players: u8,
     countdown_policy: CountdownPolicy,
+    gameplay_policy: GameplayPolicy,
     state: Mutex<LobbyRoomState>,
     updates: broadcast::Sender<LobbyUpdate>,
 }
@@ -64,6 +71,20 @@ impl LobbyRoom {
         maximum_players: u8,
         countdown_policy: CountdownPolicy,
     ) -> Self {
+        Self::new_with_policies(
+            initial_revision,
+            maximum_players,
+            countdown_policy,
+            GameplayPolicy::default(),
+        )
+    }
+
+    fn new_with_policies(
+        initial_revision: u64,
+        maximum_players: u8,
+        countdown_policy: CountdownPolicy,
+        gameplay_policy: GameplayPolicy,
+    ) -> Self {
         debug_assert!(countdown_policy.initial_seconds > 0);
         debug_assert!(countdown_policy.step_seconds > 0);
         debug_assert!(
@@ -76,6 +97,7 @@ impl LobbyRoom {
         Self {
             maximum_players,
             countdown_policy,
+            gameplay_policy,
             state: Mutex::new(LobbyRoomState {
                 revision: initial_revision,
                 next_session_id: 1,
@@ -85,6 +107,12 @@ impl LobbyRoom {
                 countdown_remaining_seconds: None,
                 manual_start_requested: false,
                 started: false,
+                gameplay_active: false,
+                game_ended: false,
+                gameplay_generation: 0,
+                gameplay_sequence: 0,
+                pending_actions: VecDeque::new(),
+                pending_action_bytes: 0,
             }),
             updates,
         }
@@ -131,6 +159,8 @@ impl LobbyRoom {
                 name: player_name,
                 ready: false,
                 loaded: false,
+                last_game_sequence: 0,
+                checksums: VecDeque::new(),
             },
         );
         state.revision = next_revision(state.revision);
@@ -178,26 +208,98 @@ impl LobbyRoom {
     }
 
     pub(crate) async fn mark_loaded(
-        &self,
+        self: &Arc<Self>,
         player_id: u8,
         session_id: u64,
     ) -> Result<(), LobbyMembershipError> {
+        let gameplay_generation = {
+            let mut state = self.state.lock().await;
+            state.require_active_session(player_id, session_id)?;
+            if !state.started || state.game_ended {
+                return Err(LobbyMembershipError::GameNotStarted);
+            }
+
+            let player = state
+                .players
+                .get_mut(&player_id)
+                .ok_or(LobbyMembershipError::UnknownSession)?;
+            if player.loaded {
+                return Ok(());
+            }
+
+            player.loaded = true;
+            let _ = self.updates.send(LobbyUpdate::PlayerLoaded { player_id });
+            self.begin_gameplay_if_ready(&mut state)?
+        };
+
+        if let Some(generation) = gameplay_generation {
+            self.spawn_gameplay(generation);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn submit_action(
+        &self,
+        player_id: u8,
+        session_id: u64,
+        sequence: u64,
+        action: PlayerAction,
+    ) -> Result<(), LobbyMembershipError> {
         let mut state = self.state.lock().await;
         state.require_active_session(player_id, session_id)?;
-        if !state.started {
-            return Err(LobbyMembershipError::GameNotStarted);
+        if !state.gameplay_active || state.game_ended {
+            return Err(LobbyMembershipError::GameNotRunning);
+        }
+        if action.player_id() != player_id {
+            return Err(LobbyMembershipError::ActionPlayerMismatch);
         }
 
-        let player = state
-            .players
-            .get_mut(&player_id)
-            .ok_or(LobbyMembershipError::UnknownSession)?;
-        if player.loaded {
-            return Ok(());
+        let action_bytes = action.data().len() + 3;
+        if state.pending_actions.len() >= MAX_PENDING_GAME_ACTIONS
+            || state.pending_action_bytes.saturating_add(action_bytes)
+                > MAX_PENDING_GAME_ACTION_BYTES
+        {
+            return Err(LobbyMembershipError::ActionQueueFull);
         }
+        state.accept_game_sequence(player_id, sequence)?;
+        state.pending_action_bytes += action_bytes;
+        state.pending_actions.push_back(action);
+        Ok(())
+    }
 
-        player.loaded = true;
-        let _ = self.updates.send(LobbyUpdate::PlayerLoaded { player_id });
+    pub(crate) async fn submit_keepalive(
+        &self,
+        player_id: u8,
+        session_id: u64,
+        sequence: u64,
+        checksum: u32,
+    ) -> Result<(), LobbyMembershipError> {
+        let desync_detected =
+            {
+                let mut state = self.state.lock().await;
+                state.require_active_session(player_id, session_id)?;
+                if !state.gameplay_active || state.game_ended {
+                    return Err(LobbyMembershipError::GameNotRunning);
+                }
+                if state.players.get(&player_id).is_some_and(|player| {
+                    player.checksums.len() >= MAX_PENDING_CHECKSUMS_PER_PLAYER
+                }) {
+                    return Err(LobbyMembershipError::ChecksumQueueFull);
+                }
+
+                state.accept_game_sequence(player_id, sequence)?;
+                state
+                    .players
+                    .get_mut(&player_id)
+                    .ok_or(LobbyMembershipError::UnknownSession)?
+                    .checksums
+                    .push_back(checksum);
+                state.consume_checksum_consensus()
+            };
+
+        if desync_detected {
+            self.end_game(GameEndReason::Desync).await;
+        }
         Ok(())
     }
 
@@ -248,27 +350,65 @@ impl LobbyRoom {
         Ok(outcome)
     }
 
-    pub(crate) async fn leave(&self, player_id: u8, session_id: u64) {
-        let mut state = self.state.lock().await;
-        let session_matches = state
-            .players
-            .get(&player_id)
-            .is_some_and(|player| player.session_id == session_id);
-        if !session_matches {
-            return;
-        }
+    pub(crate) async fn leave(
+        self: &Arc<Self>,
+        player_id: u8,
+        session_id: u64,
+        reason: LobbyLeaveReason,
+    ) -> Result<(), LobbyMembershipError> {
+        let (gameplay_generation, game_over_generation) = {
+            let mut state = self.state.lock().await;
+            let session_matches = state
+                .players
+                .get(&player_id)
+                .is_some_and(|player| player.session_id == session_id);
+            if !session_matches {
+                return Ok(());
+            }
 
-        state.players.remove(&player_id);
-        state.revision = next_revision(state.revision);
-        let roster = state.roster();
-        let countdown_was_active = state.countdown_active;
-        state.countdown_active = false;
-        state.countdown_remaining_seconds = None;
-        state.manual_start_requested = false;
-        let _ = self.updates.send(LobbyUpdate::Roster(roster));
-        if countdown_was_active {
-            let _ = self.updates.send(LobbyUpdate::CountdownCancelled);
+            if state.gameplay_active && !state.pending_actions.is_empty() {
+                self.publish_pending_actions(&mut state, 0)?;
+            }
+
+            let game_had_started = state.started;
+            state.players.remove(&player_id);
+            state.revision = next_revision(state.revision);
+            let roster = state.roster();
+            let countdown_was_active = state.countdown_active;
+            state.countdown_active = false;
+            state.countdown_remaining_seconds = None;
+            state.manual_start_requested = false;
+
+            if game_had_started {
+                let _ = self.updates.send(LobbyUpdate::PlayerLeft {
+                    player_id,
+                    reason,
+                    roster,
+                });
+            } else {
+                let _ = self.updates.send(LobbyUpdate::Roster(roster));
+                if countdown_was_active {
+                    let _ = self.updates.send(LobbyUpdate::CountdownCancelled);
+                }
+            }
+
+            if state.players.is_empty() {
+                state.reset_game();
+                (None, None)
+            } else if game_had_started && state.players.len() == 1 {
+                (None, Some(state.gameplay_generation))
+            } else {
+                (self.begin_gameplay_if_ready(&mut state)?, None)
+            }
+        };
+
+        if let Some(generation) = gameplay_generation {
+            self.spawn_gameplay(generation);
         }
+        if let Some(generation) = game_over_generation {
+            self.spawn_last_player_game_over(generation);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -278,8 +418,12 @@ impl LobbyRoom {
 
     pub(crate) async fn control_snapshot(&self) -> LobbyControlSnapshot {
         let state = self.state.lock().await;
-        let phase = if state.started {
-            LobbyPhase::Started
+        let phase = if state.game_ended {
+            LobbyPhase::Ended
+        } else if state.gameplay_active {
+            LobbyPhase::Playing
+        } else if state.started {
+            LobbyPhase::Loading
         } else if let Some(remaining_seconds) = state.countdown_remaining_seconds {
             LobbyPhase::Countdown { remaining_seconds }
         } else {
@@ -291,6 +435,128 @@ impl LobbyRoom {
             phase,
             loaded_player_ids: state.loaded_player_ids(),
         }
+    }
+
+    fn begin_gameplay_if_ready(
+        &self,
+        state: &mut LobbyRoomState,
+    ) -> Result<Option<u64>, LobbyMembershipError> {
+        if !state.started
+            || state.gameplay_active
+            || state.game_ended
+            || state.players.len() < MINIMUM_MANUAL_START_PLAYERS
+            || !state.players.values().all(|player| player.loaded)
+        {
+            return Ok(None);
+        }
+
+        state.gameplay_generation = state
+            .gameplay_generation
+            .checked_add(1)
+            .ok_or(LobbyMembershipError::GameplayGenerationExhausted)?;
+        state.gameplay_active = true;
+        state.gameplay_sequence = 0;
+        Ok(Some(state.gameplay_generation))
+    }
+
+    fn spawn_gameplay(self: &Arc<Self>, generation: u64) {
+        let room = Arc::clone(self);
+        tokio::spawn(async move {
+            room.run_gameplay(generation).await;
+        });
+    }
+
+    async fn run_gameplay(self: Arc<Self>, generation: u64) {
+        let mut tick_interval = interval_at(
+            Instant::now() + self.gameplay_policy.tick_interval,
+            self.gameplay_policy.tick_interval,
+        );
+        tick_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tick_interval.tick().await;
+            match self.publish_gameplay_tick(generation).await {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(runtime_error) => {
+                    error!(%runtime_error, "authoritative gameplay actor stopped");
+                    self.end_game(GameEndReason::ProtocolError).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn publish_gameplay_tick(&self, generation: u64) -> Result<bool, LobbyMembershipError> {
+        let mut state = self.state.lock().await;
+        if !state.gameplay_active
+            || state.game_ended
+            || state.gameplay_generation != generation
+            || state.players.is_empty()
+        {
+            return Ok(false);
+        }
+
+        self.publish_pending_actions(&mut state, self.gameplay_policy.tick_increment_ms)?;
+        Ok(true)
+    }
+
+    fn publish_pending_actions(
+        &self,
+        state: &mut LobbyRoomState,
+        time_increment_ms: u16,
+    ) -> Result<(), LobbyMembershipError> {
+        let actions = state.pending_actions.drain(..).collect::<Vec<_>>();
+        state.pending_action_bytes = 0;
+        let frames = incoming_action_frames(time_increment_ms, &actions)
+            .map_err(|_| LobbyMembershipError::GameplayFrameEncoding)?;
+
+        for frame in frames {
+            state.gameplay_sequence = state
+                .gameplay_sequence
+                .checked_add(1)
+                .ok_or(LobbyMembershipError::GameplaySequenceExhausted)?;
+            let _ = self.updates.send(LobbyUpdate::GameFrame {
+                sequence: state.gameplay_sequence,
+                frame: frame.to_bytes(),
+            });
+        }
+        Ok(())
+    }
+
+    fn spawn_last_player_game_over(self: &Arc<Self>, generation: u64) {
+        let room = Arc::clone(self);
+        tokio::spawn(async move {
+            sleep(room.gameplay_policy.last_player_game_over_delay).await;
+            let should_end = {
+                let state = room.state.lock().await;
+                state.started
+                    && !state.game_ended
+                    && state.players.len() == 1
+                    && state.gameplay_generation == generation
+            };
+            if should_end {
+                room.end_game(GameEndReason::LastPlayerStanding).await;
+            }
+        });
+    }
+
+    async fn end_game(&self, reason: GameEndReason) {
+        let mut state = self.state.lock().await;
+        if !state.started || state.game_ended {
+            return;
+        }
+        if state.players.is_empty() {
+            state.reset_game();
+            return;
+        }
+
+        state.gameplay_active = false;
+        state.game_ended = true;
+        state.gameplay_generation = state.gameplay_generation.saturating_add(1);
+        state.pending_actions.clear();
+        state.pending_action_bytes = 0;
+        let _ = self.updates.send(LobbyUpdate::GameEnded { reason });
     }
 
     fn begin_countdown(&self, state: &mut LobbyRoomState) -> Result<u64, LobbyMembershipError> {
@@ -365,11 +631,30 @@ pub(crate) struct LobbyMembership {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LobbyUpdate {
     Roster(LobbyRoster),
-    Countdown { remaining_seconds: u8 },
+    Countdown {
+        remaining_seconds: u8,
+    },
     CountdownCancelled,
-    Chat { from_player_id: u8, message: String },
+    Chat {
+        from_player_id: u8,
+        message: String,
+    },
     Start,
-    PlayerLoaded { player_id: u8 },
+    PlayerLoaded {
+        player_id: u8,
+    },
+    PlayerLeft {
+        player_id: u8,
+        reason: LobbyLeaveReason,
+        roster: LobbyRoster,
+    },
+    GameFrame {
+        sequence: u64,
+        frame: Vec<u8>,
+    },
+    GameEnded {
+        reason: GameEndReason,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -391,7 +676,9 @@ pub(crate) struct LobbyControlSnapshot {
 pub(crate) enum LobbyPhase {
     Waiting,
     Countdown { remaining_seconds: u8 },
-    Started,
+    Loading,
+    Playing,
+    Ended,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -414,6 +701,24 @@ pub(crate) enum LobbyMembershipError {
     UnknownSession,
     #[error("game loading has not started")]
     GameNotStarted,
+    #[error("authoritative gameplay is not running")]
+    GameNotRunning,
+    #[error("game action player does not match the authenticated session")]
+    ActionPlayerMismatch,
+    #[error("game tunnel sequence mismatch: expected {expected}, got {actual}")]
+    InvalidGameSequence { expected: u64, actual: u64 },
+    #[error("game tunnel sequence space is exhausted")]
+    GameSequenceExhausted,
+    #[error("pending game action queue is full")]
+    ActionQueueFull,
+    #[error("pending game checksum queue is full")]
+    ChecksumQueueFull,
+    #[error("gameplay generation space is exhausted")]
+    GameplayGenerationExhausted,
+    #[error("authoritative gameplay sequence space is exhausted")]
+    GameplaySequenceExhausted,
+    #[error("could not encode an authoritative W3GS gameplay frame")]
+    GameplayFrameEncoding,
     #[error("lobby countdown generation space is exhausted")]
     CountdownGenerationExhausted,
 }
@@ -427,6 +732,12 @@ struct LobbyRoomState {
     countdown_remaining_seconds: Option<u8>,
     manual_start_requested: bool,
     started: bool,
+    gameplay_active: bool,
+    game_ended: bool,
+    gameplay_generation: u64,
+    gameplay_sequence: u64,
+    pending_actions: VecDeque<PlayerAction>,
+    pending_action_bytes: usize,
 }
 
 impl LobbyRoomState {
@@ -491,6 +802,68 @@ impl LobbyRoomState {
 
         Ok(())
     }
+
+    fn accept_game_sequence(
+        &mut self,
+        player_id: u8,
+        sequence: u64,
+    ) -> Result<(), LobbyMembershipError> {
+        let player = self
+            .players
+            .get_mut(&player_id)
+            .ok_or(LobbyMembershipError::UnknownSession)?;
+        let expected = player
+            .last_game_sequence
+            .checked_add(1)
+            .ok_or(LobbyMembershipError::GameSequenceExhausted)?;
+        if sequence != expected {
+            return Err(LobbyMembershipError::InvalidGameSequence {
+                expected,
+                actual: sequence,
+            });
+        }
+        player.last_game_sequence = sequence;
+        Ok(())
+    }
+
+    fn consume_checksum_consensus(&mut self) -> bool {
+        while !self.players.is_empty()
+            && self
+                .players
+                .values()
+                .all(|player| !player.checksums.is_empty())
+        {
+            let expected_checksum = self
+                .players
+                .values()
+                .find_map(|player| player.checksums.front().copied())
+                .expect("all active players have a checksum");
+            let mismatch = self
+                .players
+                .values()
+                .any(|player| player.checksums.front().copied() != Some(expected_checksum));
+            for player in self.players.values_mut() {
+                player.checksums.pop_front();
+            }
+            if mismatch {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn reset_game(&mut self) {
+        self.countdown_active = false;
+        self.countdown_remaining_seconds = None;
+        self.manual_start_requested = false;
+        self.started = false;
+        self.gameplay_active = false;
+        self.game_ended = false;
+        self.gameplay_generation = self.gameplay_generation.saturating_add(1);
+        self.gameplay_sequence = 0;
+        self.pending_actions.clear();
+        self.pending_action_bytes = 0;
+    }
 }
 
 struct ConnectedPlayer {
@@ -498,6 +871,8 @@ struct ConnectedPlayer {
     name: String,
     ready: bool,
     loaded: bool,
+    last_game_sequence: u64,
+    checksums: VecDeque<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -517,6 +892,23 @@ impl Default for CountdownPolicy {
     }
 }
 
+#[derive(Clone, Copy)]
+struct GameplayPolicy {
+    tick_interval: Duration,
+    tick_increment_ms: u16,
+    last_player_game_over_delay: Duration,
+}
+
+impl Default for GameplayPolicy {
+    fn default() -> Self {
+        Self {
+            tick_interval: Duration::from_millis(100),
+            tick_increment_ms: 100,
+            last_player_game_over_delay: Duration::from_secs(60),
+        }
+    }
+}
+
 fn next_revision(current: u64) -> u64 {
     current.saturating_add(1)
 }
@@ -524,11 +916,12 @@ fn next_revision(current: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use strajer_w3gs::{Frame, IncomingActionFrame};
     use tokio::time::timeout;
 
     #[tokio::test]
     async fn allocates_and_releases_two_distinct_players() {
-        let room = LobbyRoom::new(1, 2);
+        let room = Arc::new(LobbyRoom::new(1, 2));
         let first = room
             .join("First#1000".to_owned())
             .await
@@ -546,7 +939,13 @@ mod tests {
             Some(LobbyJoinError::Full)
         );
 
-        room.leave(second.player_id, second.session_id).await;
+        room.leave(
+            second.player_id,
+            second.session_id,
+            LobbyLeaveReason::Disconnect,
+        )
+        .await
+        .expect("second player should leave");
         let roster = room.snapshot().await;
         assert_eq!(roster.players.len(), 1);
         assert_eq!(roster.players[0].player_id, 1);
@@ -554,18 +953,30 @@ mod tests {
 
     #[tokio::test]
     async fn stale_disconnect_cannot_remove_a_reused_player_id() {
-        let room = LobbyRoom::new(1, 1);
+        let room = Arc::new(LobbyRoom::new(1, 1));
         let first = room
             .join("First#1000".to_owned())
             .await
             .expect("first player should join");
-        room.leave(first.player_id, first.session_id).await;
+        room.leave(
+            first.player_id,
+            first.session_id,
+            LobbyLeaveReason::Disconnect,
+        )
+        .await
+        .expect("first player should leave");
         let replacement = room
             .join("Next#2000".to_owned())
             .await
             .expect("replacement should join");
 
-        room.leave(first.player_id, first.session_id).await;
+        room.leave(
+            first.player_id,
+            first.session_id,
+            LobbyLeaveReason::Disconnect,
+        )
+        .await
+        .expect("stale disconnect should be idempotent");
         assert_eq!(room.snapshot().await.players, replacement.roster.players);
     }
 
@@ -655,7 +1066,13 @@ mod tests {
             }
         );
 
-        room.leave(second.player_id, second.session_id).await;
+        room.leave(
+            second.player_id,
+            second.session_id,
+            LobbyLeaveReason::Disconnect,
+        )
+        .await
+        .expect("second player should leave");
         assert!(matches!(
             receive_update(&mut updates).await,
             LobbyUpdate::Roster(_)
@@ -817,6 +1234,172 @@ mod tests {
             room.control_snapshot().await.loaded_player_ids,
             vec![first.player_id, second.player_id]
         );
+    }
+
+    #[tokio::test]
+    async fn relays_authoritative_actions_and_terminates_on_desync() {
+        let room = fast_gameplay_room();
+        let (first, second, mut updates) = start_loaded_game(&room).await;
+
+        let empty_timeslot = receive_game_frame(&mut updates).await;
+        let decoded_empty = IncomingActionFrame::decode(&empty_timeslot)
+            .expect("empty authoritative timeslot should decode");
+        assert_eq!(decoded_empty.time_increment_ms(), 100);
+        assert!(decoded_empty.actions().is_empty());
+
+        room.submit_action(
+            first.player_id,
+            first.session_id,
+            1,
+            PlayerAction::new(first.player_id, vec![0x10, 0x20, 0x30])
+                .expect("test action should build"),
+        )
+        .await
+        .expect("first action should enqueue");
+
+        let action_timeslot = loop {
+            let frame = receive_game_frame(&mut updates).await;
+            let decoded = IncomingActionFrame::decode(&frame)
+                .expect("authoritative action timeslot should decode");
+            if !decoded.actions().is_empty() {
+                break decoded;
+            }
+        };
+        assert_eq!(action_timeslot.time_increment_ms(), 100);
+        assert_eq!(
+            action_timeslot.actions(),
+            &[PlayerAction::new(first.player_id, vec![0x10, 0x20, 0x30])
+                .expect("test action should build")]
+        );
+
+        room.submit_keepalive(first.player_id, first.session_id, 2, 0xAABB_CCDD)
+            .await
+            .expect("first checksum should enqueue");
+        room.submit_keepalive(second.player_id, second.session_id, 1, 0xAABB_CCDD)
+            .await
+            .expect("matching second checksum should enqueue");
+        room.submit_keepalive(first.player_id, first.session_id, 3, 0x1111_2222)
+            .await
+            .expect("next first checksum should enqueue");
+        room.submit_keepalive(second.player_id, second.session_id, 2, 0x3333_4444)
+            .await
+            .expect("mismatching second checksum should terminate the game");
+
+        loop {
+            if let LobbyUpdate::GameEnded { reason } = receive_update(&mut updates).await {
+                assert_eq!(reason, GameEndReason::Desync);
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn propagates_in_game_leave_and_resets_after_the_last_player() {
+        let room = fast_gameplay_room();
+        let (first, second, mut updates) = start_loaded_game(&room).await;
+
+        room.leave(second.player_id, second.session_id, LobbyLeaveReason::Lost)
+            .await
+            .expect("second player should leave the running game");
+        loop {
+            if let LobbyUpdate::PlayerLeft {
+                player_id,
+                reason,
+                roster,
+            } = receive_update(&mut updates).await
+            {
+                assert_eq!(player_id, second.player_id);
+                assert_eq!(reason, LobbyLeaveReason::Lost);
+                assert_eq!(roster.players.len(), 1);
+                assert_eq!(roster.players[0].player_id, first.player_id);
+                break;
+            }
+        }
+
+        loop {
+            if let LobbyUpdate::GameEnded { reason } = receive_update(&mut updates).await {
+                assert_eq!(reason, GameEndReason::LastPlayerStanding);
+                break;
+            }
+        }
+
+        room.leave(
+            first.player_id,
+            first.session_id,
+            LobbyLeaveReason::Disconnect,
+        )
+        .await
+        .expect("last player should leave");
+        let replacement = room
+            .join("Replacement#3000".to_owned())
+            .await
+            .expect("empty room should accept a new game");
+        assert_eq!(replacement.player_id, 1);
+    }
+
+    fn fast_gameplay_room() -> Arc<LobbyRoom> {
+        Arc::new(LobbyRoom::new_with_policies(
+            1,
+            2,
+            CountdownPolicy {
+                initial_seconds: 10,
+                step_seconds: 10,
+                tick_interval: Duration::from_millis(2),
+            },
+            GameplayPolicy {
+                tick_interval: Duration::from_millis(2),
+                tick_increment_ms: 100,
+                last_player_game_over_delay: Duration::from_millis(5),
+            },
+        ))
+    }
+
+    async fn start_loaded_game(
+        room: &Arc<LobbyRoom>,
+    ) -> (
+        LobbyMembership,
+        LobbyMembership,
+        broadcast::Receiver<LobbyUpdate>,
+    ) {
+        let first = room
+            .join("First#1000".to_owned())
+            .await
+            .expect("first player should join");
+        let second = room
+            .join("Second#2000".to_owned())
+            .await
+            .expect("second player should join");
+        let mut updates = first.updates.resubscribe();
+        drain_updates(&mut updates);
+
+        room.mark_ready(first.player_id, first.session_id)
+            .await
+            .expect("first player should become ready");
+        room.mark_ready(second.player_id, second.session_id)
+            .await
+            .expect("second player should become ready");
+        loop {
+            if receive_update(&mut updates).await == LobbyUpdate::Start {
+                break;
+            }
+        }
+
+        room.mark_loaded(first.player_id, first.session_id)
+            .await
+            .expect("first player should load");
+        room.mark_loaded(second.player_id, second.session_id)
+            .await
+            .expect("second player should load");
+        (first, second, updates)
+    }
+
+    async fn receive_game_frame(updates: &mut broadcast::Receiver<LobbyUpdate>) -> Frame {
+        loop {
+            if let LobbyUpdate::GameFrame { frame, .. } = receive_update(updates).await {
+                return Frame::decode_exact(&frame, 1_460)
+                    .expect("authoritative W3GS frame should decode");
+            }
+        }
     }
 
     fn drain_updates(updates: &mut broadcast::Receiver<LobbyUpdate>) {

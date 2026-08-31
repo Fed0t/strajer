@@ -124,8 +124,11 @@ Criteriu de ieșire:
 Status la 31 august 2026: host-ul virtual, chatul lobby, ready, countdown-ul
 60/50/40/30/20/10, fallback-ul `!start`, anularea la leave si pachetele
 `COUNTDOWN_START`/`COUNTDOWN_END`, `GAMELOADED_SELF` si propagarea
-`GAMELOADED_OTHERS` sunt implementate. Action batching, timeslot-urile,
-leave/lag in-game si replay raman blockerele pentru gameplay complet.
+`GAMELOADED_OTHERS` sunt implementate. Protocolul de sesiune `5` adauga
+data-plane binar, action batching la 100 ms, timeslot-uri fragmentate,
+keepalive/checksum consensus, desync detection si lifecycle in-game cu cleanup.
+Validarea live pe doua Mac-uri, lag/reconnect avansat si replay-ul raman
+blockerele pentru criteriul complet al milestone-ului.
 
 ## Milestone 4 — Strajer.app
 

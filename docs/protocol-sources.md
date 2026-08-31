@@ -47,6 +47,20 @@ Pentru framing și host engine vor fi comparate independent:
   pentru verificarea packet ID-urilor;
 - capturi locale controlate pe build-ul Reforged instalat.
 
+Pentru action loop-ul din session protocol `5`, implementarile clasice au fost
+verificate incrucisat astfel:
+
+- [gowarcraft3 `protocol/w3gs/packets.go`](https://github.com/nielsAD/gowarcraft3/blob/master/protocol/w3gs/packets.go)
+  confirma layout-ul client-side pentru `OUTGOING_ACTION` (`0x26`: CRC32 urmat
+  de action bytes) si `OUTGOING_KEEPALIVE` (`0x27`: byte necunoscut plus
+  checksum `u32`);
+- [GHost++ `gameprotocol.cpp`](https://github.com/dcramer/ghostplusplus/blob/master/ghost/gameprotocol.cpp)
+  confirma `INCOMING_ACTION` (`0x0C`), CRC-ul low-16, recordurile per player si
+  fragmentele `INCOMING_ACTION2` (`0x48`) trimise inaintea frame-ului final;
+- [GHost++ `game_base.cpp`](https://github.com/dcramer/ghostplusplus/blob/master/ghost/game_base.cpp)
+  confirma tick-ul clasic de 100 ms, limita de 1.452 bytes pentru subpacket si
+  compararea checksum-urilor numai dupa ce fiecare player activ are o valoare.
+
 Implementările publice clasice nu sunt tratate drept dovadă că Reforged păstrează
 identic fiecare câmp. Fixture-urile build-ului local au prioritate când există o
 diferență observată.

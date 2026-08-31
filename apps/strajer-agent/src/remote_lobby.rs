@@ -3,10 +3,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use strajer_protocol::{
-    AgentLobbyMessage, LOBBY_SESSION_PROTOCOL_VERSION, LobbyDescriptor, LobbyRoster,
-    MAX_LOBBY_CONTROL_MESSAGE_BYTES, ServerLobbyMessage, validate_lobby_chat_message,
-    validate_lobby_countdown_seconds,
+    AgentGameMessage, AgentLobbyMessage, GameEndReason, LOBBY_SESSION_PROTOCOL_VERSION,
+    LobbyDescriptor, LobbyLeaveReason, LobbyRoster, MAX_GAME_TUNNEL_MESSAGE_BYTES,
+    MAX_LOBBY_CONTROL_MESSAGE_BYTES, MAX_TUNNELED_W3GS_FRAME_BYTES, ServerGameMessage,
+    ServerLobbyMessage, validate_lobby_chat_message, validate_lobby_countdown_seconds,
 };
+use strajer_w3gs::{Frame, IncomingActionFrame};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at, timeout};
 use tokio_tungstenite::tungstenite::Message;
@@ -20,6 +22,12 @@ use url::Url;
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_REMOTE_WEBSOCKET_MESSAGE_BYTES: usize =
+    if MAX_LOBBY_CONTROL_MESSAGE_BYTES > MAX_GAME_TUNNEL_MESSAGE_BYTES {
+        MAX_LOBBY_CONTROL_MESSAGE_BYTES
+    } else {
+        MAX_GAME_TUNNEL_MESSAGE_BYTES
+    };
 
 type LobbyWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -31,17 +39,42 @@ pub(crate) struct RemoteLobbySession {
     heartbeat_interval: Interval,
     ready_sent: bool,
     loaded_sent: bool,
+    last_sent_game_sequence: u64,
+    last_received_game_sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RemoteLobbyEvent {
     Roster(LobbyRoster),
-    Countdown { remaining_seconds: u8 },
+    Countdown {
+        remaining_seconds: u8,
+    },
     CountdownCancelled,
-    Chat { from_player_id: u8, message: String },
-    Notice { message: String },
+    Chat {
+        from_player_id: u8,
+        message: String,
+    },
+    Notice {
+        message: String,
+    },
     Start,
-    PlayerLoaded { player_id: u8 },
+    PlayerLoaded {
+        player_id: u8,
+    },
+    PlayerLeft {
+        player_id: u8,
+        reason: LobbyLeaveReason,
+        roster: LobbyRoster,
+    },
+    GameFrame(Frame),
+    GameEnded {
+        reason: GameEndReason,
+    },
+}
+
+enum RemoteServerMessage {
+    Control(ServerLobbyMessage),
+    Game { sequence: u64, frame: Frame },
 }
 
 impl RemoteLobbySession {
@@ -57,8 +90,8 @@ impl RemoteLobbySession {
             .read_buffer_size(8_192)
             .write_buffer_size(8_192)
             .max_write_buffer_size(16_384)
-            .max_message_size(Some(MAX_LOBBY_CONTROL_MESSAGE_BYTES))
-            .max_frame_size(Some(MAX_LOBBY_CONTROL_MESSAGE_BYTES));
+            .max_message_size(Some(MAX_REMOTE_WEBSOCKET_MESSAGE_BYTES))
+            .max_frame_size(Some(MAX_REMOTE_WEBSOCKET_MESSAGE_BYTES));
         let (mut socket, response) = timeout(
             REMOTE_CONNECT_TIMEOUT,
             connect_async_with_config(request, Some(websocket_config), false),
@@ -78,6 +111,9 @@ impl RemoteLobbySession {
             .await
             .context("coordinated lobby join response timed out")??
             .context("coordinated lobby closed before accepting the player")?;
+        let RemoteServerMessage::Control(joined) = joined else {
+            bail!("coordinated lobby sent gameplay before join acceptance");
+        };
         let (protocol_version, assigned_player_id, roster) = match joined {
             ServerLobbyMessage::Joined {
                 protocol_version,
@@ -95,7 +131,9 @@ impl RemoteLobbySession {
             | ServerLobbyMessage::Chat { .. }
             | ServerLobbyMessage::Notice { .. }
             | ServerLobbyMessage::Start
-            | ServerLobbyMessage::PlayerLoaded { .. } => {
+            | ServerLobbyMessage::PlayerLoaded { .. }
+            | ServerLobbyMessage::PlayerLeft { .. }
+            | ServerLobbyMessage::GameEnded { .. } => {
                 bail!("coordinated lobby started control flow before join acceptance")
             }
         };
@@ -129,6 +167,8 @@ impl RemoteLobbySession {
             heartbeat_interval,
             ready_sent: false,
             loaded_sent: false,
+            last_sent_game_sequence: 0,
+            last_received_game_sequence: 0,
         })
     }
 
@@ -166,6 +206,25 @@ impl RemoteLobbySession {
         Ok(())
     }
 
+    pub(crate) async fn send_game_frame(&mut self, frame: &Frame) -> Result<()> {
+        let sequence = self
+            .last_sent_game_sequence
+            .checked_add(1)
+            .context("agent gameplay sequence space is exhausted")?;
+        let message = AgentGameMessage::w3gs_frame(sequence, frame.to_bytes())
+            .context("could not encode agent gameplay frame")?;
+        self.socket
+            .send(Message::Binary(message.encode().into()))
+            .await
+            .context("could not send agent gameplay frame")?;
+        self.last_sent_game_sequence = sequence;
+        Ok(())
+    }
+
+    pub(crate) async fn leave(&mut self, reason: LobbyLeaveReason) -> Result<()> {
+        send_agent_message(&mut self.socket, &AgentLobbyMessage::leave(reason)).await
+    }
+
     pub(crate) async fn next_event(&mut self) -> Result<Option<RemoteLobbyEvent>> {
         loop {
             tokio::select! {
@@ -184,7 +243,14 @@ impl RemoteLobbySession {
                         continue;
                     };
 
-                    return self.validate_active_server_message(message);
+                    match message {
+                        RemoteServerMessage::Control(message) => {
+                            return self.validate_active_server_message(message);
+                        }
+                        RemoteServerMessage::Game { sequence, frame } => {
+                            return self.validate_active_server_game_message(sequence, frame);
+                        }
+                    }
                 }
                 _ = self.heartbeat_interval.tick() => {
                     self.socket
@@ -244,6 +310,34 @@ impl RemoteLobbySession {
                 }
                 Ok(Some(RemoteLobbyEvent::PlayerLoaded { player_id }))
             }
+            ServerLobbyMessage::PlayerLeft {
+                player_id,
+                reason,
+                roster,
+            } => {
+                if player_id == 0
+                    || player_id > self.maximum_players
+                    || player_id == self.assigned_player_id
+                {
+                    bail!("coordinated lobby returned an invalid departed player");
+                }
+                roster
+                    .validate(self.maximum_players)
+                    .context("coordinated lobby returned an invalid post-leave roster")?;
+                if roster.player(player_id).is_some()
+                    || roster.player(self.assigned_player_id).is_none()
+                {
+                    bail!("coordinated lobby returned an inconsistent post-leave roster");
+                }
+                Ok(Some(RemoteLobbyEvent::PlayerLeft {
+                    player_id,
+                    reason,
+                    roster,
+                }))
+            }
+            ServerLobbyMessage::GameEnded { reason } => {
+                Ok(Some(RemoteLobbyEvent::GameEnded { reason }))
+            }
             ServerLobbyMessage::Rejected { code } => {
                 bail!("coordinated lobby rejected the active session: {code:?}")
             }
@@ -251,6 +345,26 @@ impl RemoteLobbySession {
                 bail!("coordinated lobby sent duplicate join acceptance")
             }
         }
+    }
+
+    fn validate_active_server_game_message(
+        &mut self,
+        sequence: u64,
+        frame: Frame,
+    ) -> Result<Option<RemoteLobbyEvent>> {
+        let expected_sequence = self
+            .last_received_game_sequence
+            .checked_add(1)
+            .context("server gameplay sequence space is exhausted")?;
+        if sequence != expected_sequence {
+            bail!(
+                "coordinated lobby gameplay sequence mismatch: expected {expected_sequence}, got {sequence}"
+            );
+        }
+        IncomingActionFrame::decode(&frame)
+            .context("coordinated lobby returned an invalid W3GS timeslot")?;
+        self.last_received_game_sequence = sequence;
+        Ok(Some(RemoteLobbyEvent::GameFrame(frame)))
     }
 }
 
@@ -283,7 +397,9 @@ async fn send_agent_message(
         .context("could not send agent lobby message")
 }
 
-async fn receive_server_message(socket: &mut LobbyWebSocket) -> Result<Option<ServerLobbyMessage>> {
+async fn receive_server_message(
+    socket: &mut LobbyWebSocket,
+) -> Result<Option<RemoteServerMessage>> {
     loop {
         let Some(message) = socket.next().await else {
             return Ok(None);
@@ -298,7 +414,7 @@ async fn receive_server_message(socket: &mut LobbyWebSocket) -> Result<Option<Se
 async fn handle_server_websocket_message(
     socket: &mut LobbyWebSocket,
     message: Message,
-) -> Result<Option<ServerLobbyMessage>> {
+) -> Result<Option<RemoteServerMessage>> {
     match message {
         Message::Text(text) => {
             if text.len() > MAX_LOBBY_CONTROL_MESSAGE_BYTES {
@@ -306,7 +422,7 @@ async fn handle_server_websocket_message(
             }
             let message = serde_json::from_str::<ServerLobbyMessage>(&text)
                 .context("could not decode coordinated lobby message")?;
-            Ok(Some(message))
+            Ok(Some(RemoteServerMessage::Control(message)))
         }
         Message::Ping(payload) => {
             socket
@@ -317,10 +433,25 @@ async fn handle_server_websocket_message(
         }
         Message::Pong(_) => Ok(None),
         Message::Close(_) => Ok(None),
-        Message::Binary(_) | Message::Frame(_) => {
-            bail!("coordinated lobby sent an unsupported WebSocket message")
+        Message::Binary(payload) => Ok(Some(decode_server_game_message(&payload)?)),
+        Message::Frame(_) => {
+            bail!("coordinated lobby sent an unsupported raw WebSocket frame")
         }
     }
+}
+
+fn decode_server_game_message(payload: &[u8]) -> Result<RemoteServerMessage> {
+    if payload.len() > MAX_GAME_TUNNEL_MESSAGE_BYTES {
+        bail!("coordinated lobby gameplay message exceeds configured limit");
+    }
+    let message = ServerGameMessage::decode(payload)
+        .context("could not decode coordinated lobby gameplay message")?;
+    let frame = Frame::decode_exact(message.frame(), MAX_TUNNELED_W3GS_FRAME_BYTES)
+        .context("could not decode coordinated lobby W3GS gameplay frame")?;
+    Ok(RemoteServerMessage::Game {
+        sequence: message.sequence(),
+        frame,
+    })
 }
 
 fn lobby_session_endpoint(server_url: &str, lobby_id: &str) -> Result<Url> {
@@ -349,6 +480,7 @@ fn lobby_session_endpoint(server_url: &str, lobby_id: &str) -> Result<Url> {
 #[cfg(test)]
 mod tests {
     use strajer_server::{AppState, router};
+    use strajer_w3gs::{IncomingActionFrame, incoming_action_frames};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -392,6 +524,34 @@ mod tests {
                 .expect("authorization should be present"),
             &format!("Bearer {TEST_JOIN_TOKEN}")
         );
+    }
+
+    #[test]
+    fn decodes_binary_authoritative_timeslots() {
+        let frame = incoming_action_frames(100, &[])
+            .expect("test timeslot should build")
+            .remove(0);
+        let payload = ServerGameMessage::w3gs_frame(7, frame.to_bytes())
+            .expect("server game message should build")
+            .encode();
+
+        let decoded =
+            decode_server_game_message(&payload).expect("server gameplay message should decode");
+        let RemoteServerMessage::Game { sequence, frame } = decoded else {
+            panic!("binary gameplay message must not decode as control");
+        };
+        assert_eq!(sequence, 7);
+        assert_eq!(
+            IncomingActionFrame::decode(&frame)
+                .expect("decoded timeslot should validate")
+                .time_increment_ms(),
+            100
+        );
+
+        let wrong_direction = AgentGameMessage::w3gs_frame(7, frame.to_bytes())
+            .expect("agent game message should build")
+            .encode();
+        assert!(decode_server_game_message(&wrong_direction).is_err());
     }
 
     #[tokio::test]

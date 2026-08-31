@@ -8,6 +8,7 @@ use crate::{Frame, FrameError};
 pub const PLAYER_INFO_PACKET_ID: u8 = 0x06;
 pub const PLAYER_LEAVE_OTHERS_PACKET_ID: u8 = 0x07;
 pub const GAME_LOADED_OTHERS_PACKET_ID: u8 = 0x08;
+pub const GAME_OVER_PACKET_ID: u8 = 0x14;
 pub const GAME_LOADED_SELF_PACKET_ID: u8 = 0x23;
 pub const MAX_CLASSIC_PLAYER_NAME_BYTES: usize = 15;
 const PLAYER_JOIN_COUNTER: u32 = 1;
@@ -33,14 +34,47 @@ pub fn player_info_frame(
 }
 
 pub fn player_leave_others_frame(player_id: u8) -> Result<Frame, PlayerFrameError> {
+    player_leave_others_frame_with_reason(player_id, PLAYER_LEAVE_LOBBY_CODE)
+}
+
+pub fn player_leave_others_frame_with_reason(
+    player_id: u8,
+    reason: u32,
+) -> Result<Frame, PlayerFrameError> {
     if player_id == 0 {
         return Err(PlayerFrameError::InvalidPlayerId);
     }
 
     let mut payload = Vec::with_capacity(5);
     payload.push(player_id);
-    payload.extend_from_slice(&PLAYER_LEAVE_LOBBY_CODE.to_le_bytes());
+    payload.extend_from_slice(&reason.to_le_bytes());
     Ok(Frame::new(PLAYER_LEAVE_OTHERS_PACKET_ID, payload)?)
+}
+
+pub fn leave_request_reason(frame: &Frame) -> Result<u32, PlayerFrameError> {
+    if frame.packet_id() != crate::LEAVE_REQUEST_PACKET_ID {
+        return Err(PlayerFrameError::UnexpectedPacketId {
+            actual: frame.packet_id(),
+        });
+    }
+    if frame.payload().len() != 4 {
+        return Err(PlayerFrameError::InvalidLeaveRequestPayload {
+            actual: frame.payload().len(),
+        });
+    }
+    Ok(u32::from_le_bytes(
+        frame
+            .payload()
+            .try_into()
+            .expect("leave request payload length was validated"),
+    ))
+}
+
+pub fn game_over_frame(player_id: u8) -> Result<Frame, PlayerFrameError> {
+    if player_id == 0 {
+        return Err(PlayerFrameError::InvalidPlayerId);
+    }
+    Ok(Frame::new(GAME_OVER_PACKET_ID, vec![player_id])?)
 }
 
 pub fn game_loaded_others_frame(player_id: u8) -> Result<Frame, PlayerFrameError> {
@@ -88,6 +122,8 @@ pub enum PlayerFrameError {
     UnexpectedPacketId { actual: u8 },
     #[error("W3GS_GAMELOADED_SELF payload must be empty")]
     InvalidGameLoadedSelfPayload,
+    #[error("W3GS_LEAVE_REQUEST payload contains {actual} bytes; expected 4")]
+    InvalidLeaveRequestPayload { actual: usize },
     #[error("W3GS player id must not be zero")]
     InvalidPlayerId,
     #[error("W3GS player name contains {actual} bytes; expected 1 to {maximum} without NUL")]
@@ -121,6 +157,32 @@ mod tests {
 
         assert_eq!(frame.packet_id(), PLAYER_LEAVE_OTHERS_PACKET_ID);
         assert_eq!(frame.payload(), &[2, 13, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decodes_leave_reason_and_encodes_game_over() {
+        let leave = Frame::new(
+            crate::LEAVE_REQUEST_PACKET_ID,
+            0x07_u32.to_le_bytes().to_vec(),
+        )
+        .expect("leave request should build");
+
+        assert_eq!(
+            leave_request_reason(&leave).expect("leave reason should decode"),
+            0x07
+        );
+        assert_eq!(
+            player_leave_others_frame_with_reason(2, 0x07)
+                .expect("leave notification should build")
+                .payload(),
+            &[2, 7, 0, 0, 0]
+        );
+        assert_eq!(
+            game_over_frame(11)
+                .expect("game over should build")
+                .to_bytes(),
+            [0xF7, 0x14, 5, 0, 11]
+        );
     }
 
     #[test]

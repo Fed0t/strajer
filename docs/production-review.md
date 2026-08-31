@@ -5,9 +5,9 @@ Data review-ului: 31 august 2026.
 ## Verdict
 
 Strajer este un vertical slice functional pentru discovery LAN, join coordonat,
-distributia hartii, lobby sincronizat si tranzitia automata spre loading. Nu este
-inca un host de joc complet si nu trebuie prezentat ca productie: dupa `Start`
-lipseste data-plane-ul W3GS care sincronizeaza efectiv jocul intre clienti.
+distributia hartii, lobby sincronizat si un action loop W3GS autoritativ. Nu
+trebuie prezentat inca drept productie: data-plane-ul este validat automat, dar
+nu a trecut gate-ul live de 15 minute pe doua Mac-uri si nu genereaza replay.
 
 ## Implementat si verificat automat
 
@@ -23,41 +23,41 @@ lipseste data-plane-ul W3GS care sincronizeaza efectiv jocul intre clienti.
   jucatori, anulare la leave si tranzitie spre loading;
 - coordonare idempotenta `GAMELOADED_SELF`/`GAMELOADED_OTHERS` pentru jucatorii
   umani, cu snapshot pentru recuperarea update-urilor pierdute;
+- protocol de sesiune `5`, cu envelope binar directional, frame W3GS de maximum
+  1.460 bytes si sequence number monoton per directie;
+- actor autoritativ la 100 ms pentru `OUTGOING_ACTION` ->
+  `INCOMING_ACTION`/`INCOMING_ACTION2`, cozi bounded si CRC validation;
+- consensus pentru `OUTGOING_KEEPALIVE`, terminare determinista la desync,
+  leave/disconnect in-game, game-over si reset de lobby;
 - nickname persistent si actiunea `Nickname...` in menu bar;
 - refuz strict al unui WebUI Blizzard care nu are semnatura cunoscuta exact;
 - container Linux non-root, read-only, fara capabilitati si cu healthcheck;
 - build macOS universal `arm64` + `x86_64`, verificat prin `codesign` ad-hoc.
 
-Validarea curenta are 83 de teste Rust, testul Swift pe fixture-ul WebUI real,
+Validarea curenta are 94 de teste Rust, testul Swift pe fixture-ul WebUI real,
 `cargo clippy -D warnings`, verificarea Docker Compose, build-ul imaginii Docker
 si verificarea bundle-ului/ZIP-ului macOS.
 
-## P0 - blocante pentru un joc real
+## P0 - gate-uri pentru un joc real
 
-### 1. Data-plane W3GS dupa loading
+### 1. Validare live a data-plane-ului
 
-Agentul coordoneaza finalizarea loading-ului, dar nu proceseaza inca:
+Actorul autoritativ, WSS binar, action batching, keepalive consensus si
+detectarea desync sunt implementate. Mai trebuie confirmate pe doua instalari
+Reforged reale:
 
-- `OUTGOING_ACTION` si ordonarea/batching-ul in `INCOMING_ACTION`/`INCOMING_ACTION2`;
-- `OUTGOING_KEEPALIVE`, checksum consensus si detectarea desync;
-- leave, lag, drop si timeout-uri in-game;
-- fluxul de replay `.w3g`.
+- avansarea identica a jocului timp de minimum 15 minute;
+- checksum stream identic si comportament determinist la packet delay/drop;
+- leave in loading, leave in-game si pierderea WSS;
+- limitele practice de RTT si head-of-line blocking prin proxy.
 
-Impact: clientii pot termina loading-ul coordonat, dar ceasul jocului si
-comenzile nu pot avansa sincronizat. Acesta este blocantul principal si
-urmatorul milestone obligatoriu.
+QUIC ramane o optimizare conditionata de masuratori, nu un blocker implicit.
 
-Solutia recomandata: actor autoritativ per joc pe server, cu un canal binar
-separat de control, cozi bounded per client, secvente monotone, tick scheduling,
-backpressure si limite explicite pe frame/action. WSS binar este suficient pentru
-prima versiune corecta; QUIC trebuie introdus numai dupa masurarea RTT si
-head-of-line blocking.
+### 2. Replay si soak
 
-### 2. Lifecycle-ul jocului
-
-Camera ramane in starea `started` pana la restartul procesului. Lipsesc starea de
-game over, cleanup-ul determinist, un lobby nou si protectia fata de sesiuni
-fantoma dupa restart/reconnect.
+Game-over si resetul camerei sunt implementate pentru leave, disconnect,
+last-player-standing si desync. Lipsesc replay-ul `.w3g`, testul a 50 de cicluri
+consecutive si verificarea absentei task-urilor/sesiunilor fantoma sub load.
 
 ## P1 - blocante pentru private beta stabil
 

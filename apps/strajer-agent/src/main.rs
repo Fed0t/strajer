@@ -15,15 +15,17 @@ use reqwest::Client;
 use serde::Serialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use strajer_lan::PublishedLobby;
-use strajer_protocol::{LobbyCatalog, LobbyDescriptor, LobbyPlayer, LobbyRoster};
+use strajer_protocol::{LobbyCatalog, LobbyDescriptor, LobbyLeaveReason, LobbyPlayer, LobbyRoster};
 use strajer_w3gs::{
     CHAT_TO_HOST_PACKET_ID, ControlFrameError, Frame, FrameReader, GAME_LOADED_SELF_PACKET_ID,
     LEAVE_REQUEST_PACKET_ID, LobbyChatToHost, MAP_PART_DATA_BYTES, MAP_PART_NOT_OK_PACKET_ID,
     MAP_PART_OK_PACKET_ID, MAP_SIZE_PACKET_ID, MapCheck, MapPartAck, MapSize,
+    OUTGOING_ACTION_PACKET_ID, OUTGOING_KEEPALIVE_PACKET_ID, OutgoingAction, OutgoingKeepAlive,
     PONG_TO_HOST_PACKET_ID, PROTOBUF_PACKET_ID, ProtobufEnvelope, RACE_HUMAN, RACE_NIGHT_ELF,
     RACE_UNDEAD, ReqJoin, SlotData, SlotInfo, SlotLayout, chat_from_host, countdown_end,
-    countdown_start, game_loaded_others_frame, leave_ack, map_part_frame, ping_from_host,
-    player_info_frame, player_leave_others_frame, player_profile_frame, player_skins_frame,
+    countdown_start, game_loaded_others_frame, game_over_frame, leave_ack, leave_request_reason,
+    map_part_frame, ping_from_host, player_info_frame, player_leave_others_frame,
+    player_leave_others_frame_with_reason, player_profile_frame, player_skins_frame,
     start_download_frame, validate_game_loaded_self,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -780,6 +782,59 @@ async fn run_lobby_session(
                             "reported remote player as loaded to Warcraft"
                         );
                     }
+                    RemoteLobbyEvent::PlayerLeft {
+                        player_id,
+                        reason,
+                        roster: next_roster,
+                    } => {
+                        if !game_started {
+                            bail!("coordinated lobby reported an in-game leave before game start");
+                        }
+                        if roster.player(player_id).is_none() {
+                            bail!("coordinated lobby reported an unknown departed player");
+                        }
+                        if next_roster.revision <= roster.revision {
+                            bail!("coordinated lobby returned a stale post-leave roster");
+                        }
+                        write_frame(
+                            &mut stream,
+                            &player_leave_others_frame_with_reason(
+                                player_id,
+                                reason.w3gs_code(),
+                            )?,
+                        )
+                        .await?;
+                        loaded_remote_player_ids.remove(&player_id);
+                        roster = next_roster;
+                        info!(
+                            lobby_id = %config.lobby.id,
+                            player_id,
+                            ?reason,
+                            "reported departed in-game player to Warcraft"
+                        );
+                    }
+                    RemoteLobbyEvent::GameFrame(frame) => {
+                        if !game_started {
+                            bail!("coordinated lobby sent gameplay before game start");
+                        }
+                        write_frame(&mut stream, &frame).await?;
+                    }
+                    RemoteLobbyEvent::GameEnded { reason } => {
+                        if !game_started {
+                            bail!("coordinated lobby ended a game before it started");
+                        }
+                        write_frame(
+                            &mut stream,
+                            &game_over_frame(config.lobby.virtual_host.player_id)?,
+                        )
+                        .await?;
+                        info!(
+                            lobby_id = %config.lobby.id,
+                            ?reason,
+                            "reported coordinated game over to Warcraft"
+                        );
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -922,9 +977,17 @@ async fn handle_lobby_frame(
             }
         }
         LEAVE_REQUEST_PACKET_ID => {
+            let raw_reason = leave_request_reason(&frame)?;
+            let reason = LobbyLeaveReason::from_w3gs_code(raw_reason)
+                .context("Warcraft sent an unsupported leave reason")?;
+            remote_session.leave(reason).await?;
             let frame = leave_ack()?;
             write_frame(stream, &frame).await?;
-            info!(lobby_id = %config.lobby.id, "Warcraft requested to leave the lobby");
+            info!(
+                lobby_id = %config.lobby.id,
+                ?reason,
+                "Warcraft requested to leave the lobby"
+            );
             return Ok(true);
         }
         PONG_TO_HOST_PACKET_ID => {
@@ -941,6 +1004,22 @@ async fn handle_lobby_frame(
                 player_id = assigned_player_id,
                 "Warcraft finished loading the map"
             );
+        }
+        OUTGOING_ACTION_PACKET_ID => {
+            if !game_started {
+                bail!("Warcraft sent a game action before coordinated game start");
+            }
+            OutgoingAction::decode(&frame)
+                .context("Warcraft sent an invalid W3GS outgoing action")?;
+            remote_session.send_game_frame(&frame).await?;
+        }
+        OUTGOING_KEEPALIVE_PACKET_ID => {
+            if !game_started {
+                bail!("Warcraft sent a keepalive before coordinated game start");
+            }
+            OutgoingKeepAlive::decode(&frame)
+                .context("Warcraft sent an invalid W3GS outgoing keepalive")?;
+            remote_session.send_game_frame(&frame).await?;
         }
         CHAT_TO_HOST_PACKET_ID => match LobbyChatToHost::decode(&frame) {
             Ok(chat) => {
