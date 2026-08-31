@@ -33,11 +33,13 @@ private struct AgentStatusEvent: Decodable {
     let event: String
     let lobbyCount: Int?
     let lobbyID: String?
+    let nickname: String?
 
     private enum CodingKeys: String, CodingKey {
         case event
         case lobbyCount = "lobby_count"
         case lobbyID = "lobby_id"
+        case nickname
     }
 }
 
@@ -59,6 +61,11 @@ final class AgentController: ObservableObject {
     private var restartTask: Task<Void, Never>?
     private var shouldRun = false
     private var restartImmediately = false
+    private let nicknameController: NicknameController
+
+    init(nicknameController: NicknameController) {
+        self.nicknameController = nicknameController
+    }
 
     func start() {
         shouldRun = true
@@ -224,43 +231,55 @@ final class AgentController: ObservableObject {
     }
 
     private func consumeStandardOutput(_ data: Data) {
-        appendLogData(data)
         standardOutputBuffer.append(data)
 
         while let newlineIndex = standardOutputBuffer.firstIndex(of: 0x0A) {
             let lineData = standardOutputBuffer[..<newlineIndex]
             standardOutputBuffer.removeSubrange(...newlineIndex)
-            consumeStatusLine(Data(lineData))
+            let statusLine = Data(lineData)
+            if consumeStatusLine(statusLine) {
+                appendLogMarker("Captured Warcraft nickname")
+            } else {
+                appendLogLine(statusLine)
+            }
         }
     }
 
-    private func consumeStatusLine(_ lineData: Data) {
+    private func consumeStatusLine(_ lineData: Data) -> Bool {
         guard let event = try? JSONDecoder().decode(AgentStatusEvent.self, from: lineData) else {
-            return
+            return false
         }
 
         switch event.event {
         case "ready":
             guard let lobbyCount = event.lobbyCount else {
-                return
+                return false
             }
             status = .connected
             availableGames = lobbyCount
             lastError = nil
         case "join_request_captured":
             guard event.lobbyID != nil else {
-                return
+                return false
             }
             joinRequestCaptured = true
         case "lobby_joined":
             guard event.lobbyID != nil else {
-                return
+                return false
             }
             joinRequestCaptured = true
             lobbyJoined = true
+        case "nickname_captured":
+            guard let nickname = event.nickname else {
+                return true
+            }
+            nicknameController.capture(nickname)
+            return true
         default:
-            return
+            return false
         }
+
+        return false
     }
 
     private func consumeStandardError(_ data: Data) {
@@ -367,6 +386,11 @@ final class AgentController: ObservableObject {
         }
 
         appendLogData(data)
+    }
+
+    private func appendLogLine(_ data: Data) {
+        appendLogData(data)
+        appendLogData(Data([0x0A]))
     }
 
     private func appendLogData(_ data: Data) {

@@ -13,6 +13,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
+socket2.workspace = true
 strajer-lan = { path = "../../crates/strajer-lan" }
 strajer-protocol = { path = "../../crates/strajer-protocol" }
 strajer-w3gs = { path = "../../crates/strajer-w3gs" }

@@ -8,9 +8,16 @@ struct StrajerApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            StrajerMenuView(controller: appDelegate.agentController)
+            StrajerMenuView(
+                controller: appDelegate.agentController,
+                compatibilityController: appDelegate.compatibilityController,
+                nicknameController: appDelegate.nicknameController
+            )
         } label: {
-            StrajerMenuBarLabel(controller: appDelegate.agentController)
+            StrajerMenuBarLabel(
+                controller: appDelegate.agentController,
+                compatibilityController: appDelegate.compatibilityController
+            )
         }
         .menuBarExtraStyle(.menu)
     }
@@ -18,33 +25,60 @@ struct StrajerApp: App {
 
 @MainActor
 final class StrajerAppDelegate: NSObject, NSApplicationDelegate {
-    let agentController = AgentController()
+    let nicknameController: NicknameController
+    let agentController: AgentController
+    let compatibilityController: WarcraftCompatibilityController
+
+    override init() {
+        let nicknameController = NicknameController()
+        self.nicknameController = nicknameController
+        agentController = AgentController(nicknameController: nicknameController)
+        compatibilityController = WarcraftCompatibilityController(
+            nicknameController: nicknameController
+        )
+        super.init()
+        nicknameController.delegate = compatibilityController
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        compatibilityController.start()
         agentController.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         agentController.stop()
+        compatibilityController.stop()
     }
 }
 
 private struct StrajerMenuBarLabel: View {
     @ObservedObject var controller: AgentController
+    @ObservedObject var compatibilityController: WarcraftCompatibilityController
 
     var body: some View {
         Image(systemName: controller.status.symbolName)
             .accessibilityLabel("Strajer")
-            .help(controller.status.description)
+            .help(
+                "\(controller.status.description); "
+                    + compatibilityController.status.description
+            )
     }
 }
 
 private struct StrajerMenuView: View {
     @ObservedObject var controller: AgentController
+    @ObservedObject var compatibilityController: WarcraftCompatibilityController
+    @ObservedObject var nicknameController: NicknameController
 
     var body: some View {
         Text("Strajer")
             .font(.headline)
+
+        Button("Nickname...") {
+            nicknameController.promptForNickname()
+        }
+
+        Text("Nickname: \(nicknameController.menuDescription)")
 
         Text(controller.status.description)
 
@@ -61,6 +95,21 @@ private struct StrajerMenuView: View {
         if let lastError = controller.lastError, controller.status == .unavailable {
             Text(lastError)
                 .lineLimit(2)
+        }
+
+        Divider()
+
+        Text(compatibilityController.status.description)
+
+        if let compatibilityError = compatibilityController.status.errorDescription {
+            Text(compatibilityError)
+                .lineLimit(3)
+        }
+
+        if compatibilityController.status.canRetry {
+            Button("Retry Offline LAN Fix") {
+                compatibilityController.retry()
+            }
         }
 
         Divider()

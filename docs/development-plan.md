@@ -14,7 +14,9 @@ Serverul este operat centralizat și nu există configurare de endpoint în apli
 
 ## Principii
 
-- Fără modificarea binarului, fișierelor sau UI-ului Warcraft III.
+- Fără modificarea binarului sau arhivei CASC Warcraft III. Orice override WebUI
+  local trebuie derivat din instalarea utilizatorului, verificat strict și
+  refuzat pentru versiuni necunoscute.
 - Fără integrare cu matchmaking-ul sau catalogul Multiplayer Battle.net.
 - Protocolul LAN, control-plane-ul și transportul jocului rămân module separate.
 - Serverul acceptă numai conexiuni autentificate și criptate înainte de expunerea publică.
@@ -104,7 +106,10 @@ Durată estimată: 4–8 săptămâni.
 
 Livrabile:
 
-- countdown, load synchronization și start;
+- host virtual `Strajer` in slotul `HOSTBOT` si 10 sloturi umane;
+- ready per client dupa verificarea hartii, countdown automat de 60 secunde si
+  start autoritativ pe server cand toate sloturile umane sunt ocupate;
+- load synchronization pentru jucatorii umani;
 - action batching, keepalive și desync detection;
 - leave/lag handling;
 - generare și validare replay `.w3g`.
@@ -112,6 +117,11 @@ Livrabile:
 Criteriu de ieșire:
 
 - două instanțe Reforged joacă minimum 15 minute și produc un replay valid, repetat în 50 de cicluri consecutive.
+
+Status la 31 august 2026: host-ul virtual, ready, countdown-ul 60/50/40/30/20/10,
+anularea la leave si pachetele `COUNTDOWN_START`/`COUNTDOWN_END` sunt implementate.
+Load sync uman, action batching, leave/lag in-game si replay raman blockerele
+pentru gameplay complet.
 
 ## Milestone 4 — Strajer.app
 
@@ -130,8 +140,12 @@ Criteriu de ieșire:
 
 - după instalare și acordarea permisiunii Local Network nu există configurare manuală.
 
-Status la 30 august 2026: shell-ul `MenuBarExtra`, agentul inclus, statusul,
+Status la 31 august 2026: shell-ul `MenuBarExtra`, agentul inclus, statusul,
 indicatorul `Join request detected` și build-ul universal sunt implementate.
+Aplicatia activeaza automat workaround-ul WebUI offline, derivat si validat din
+instalarea Warcraft locala, fara a redistribui fisierul Blizzard. Nickname-ul se
+salveaza dupa primul join si poate fi schimbat din actiunea `Nickname...` din
+menu bar.
 Launch at login, update-ul semnat, crash reporting, Developer ID și notarizarea
 rămân deschise.
 

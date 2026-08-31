@@ -4,10 +4,10 @@ use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use strajer_protocol::{
     AgentLobbyMessage, LOBBY_SESSION_PROTOCOL_VERSION, LobbyDescriptor, LobbyRoster,
-    MAX_LOBBY_CONTROL_MESSAGE_BYTES, ServerLobbyMessage,
+    MAX_LOBBY_CONTROL_MESSAGE_BYTES, ServerLobbyMessage, validate_lobby_countdown_seconds,
 };
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
@@ -18,6 +18,7 @@ use url::Url;
 
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 type LobbyWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -26,6 +27,16 @@ pub(crate) struct RemoteLobbySession {
     assigned_player_id: u8,
     initial_roster: LobbyRoster,
     maximum_players: u8,
+    heartbeat_interval: Interval,
+    ready_sent: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteLobbyEvent {
+    Roster(LobbyRoster),
+    Countdown { remaining_seconds: u8 },
+    CountdownCancelled,
+    Start,
 }
 
 impl RemoteLobbySession {
@@ -74,6 +85,11 @@ impl RemoteLobbySession {
             ServerLobbyMessage::Roster { .. } => {
                 bail!("coordinated lobby sent roster before join acceptance")
             }
+            ServerLobbyMessage::Countdown { .. }
+            | ServerLobbyMessage::CountdownCancelled
+            | ServerLobbyMessage::Start => {
+                bail!("coordinated lobby started control flow before join acceptance")
+            }
         };
 
         if protocol_version != LOBBY_SESSION_PROTOCOL_VERSION {
@@ -82,7 +98,7 @@ impl RemoteLobbySession {
             );
         }
         roster
-            .validate(lobby.players.max)
+            .validate(lobby.human_player_capacity())
             .context("coordinated lobby returned an invalid roster")?;
         let assigned_player = roster
             .player(assigned_player_id)
@@ -91,11 +107,19 @@ impl RemoteLobbySession {
             bail!("coordinated lobby assigned player name does not match the join request");
         }
 
+        let mut heartbeat_interval = interval_at(
+            Instant::now() + REMOTE_HEARTBEAT_INTERVAL,
+            REMOTE_HEARTBEAT_INTERVAL,
+        );
+        heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
         Ok(Self {
             socket,
             assigned_player_id,
             initial_roster: roster,
-            maximum_players: lobby.players.max,
+            maximum_players: lobby.human_player_capacity(),
+            heartbeat_interval,
+            ready_sent: false,
         })
     }
 
@@ -107,18 +131,66 @@ impl RemoteLobbySession {
         &self.initial_roster
     }
 
-    pub(crate) async fn next_roster(&mut self) -> Result<Option<LobbyRoster>> {
-        let Some(message) = receive_server_message(&mut self.socket).await? else {
-            return Ok(None);
-        };
+    pub(crate) async fn mark_ready(&mut self) -> Result<()> {
+        if self.ready_sent {
+            return Ok(());
+        }
 
+        send_agent_message(&mut self.socket, &AgentLobbyMessage::ready()).await?;
+        self.ready_sent = true;
+        Ok(())
+    }
+
+    pub(crate) async fn next_event(&mut self) -> Result<Option<RemoteLobbyEvent>> {
+        loop {
+            tokio::select! {
+                received = self.socket.next() => {
+                    let Some(message) = received else {
+                        return Ok(None);
+                    };
+                    let message = message.context(
+                        "could not read coordinated lobby WebSocket"
+                    )?;
+                    let Some(message) = handle_server_websocket_message(
+                        &mut self.socket,
+                        message,
+                    )
+                    .await? else {
+                        continue;
+                    };
+
+                    return self.validate_active_server_message(message);
+                }
+                _ = self.heartbeat_interval.tick() => {
+                    self.socket
+                        .send(Message::Ping(Vec::new().into()))
+                        .await
+                        .context("could not send coordinated lobby heartbeat")?;
+                }
+            }
+        }
+    }
+
+    fn validate_active_server_message(
+        &self,
+        message: ServerLobbyMessage,
+    ) -> Result<Option<RemoteLobbyEvent>> {
         match message {
             ServerLobbyMessage::Roster { roster } => {
                 roster
                     .validate(self.maximum_players)
                     .context("coordinated lobby returned an invalid roster update")?;
-                Ok(Some(roster))
+                Ok(Some(RemoteLobbyEvent::Roster(roster)))
             }
+            ServerLobbyMessage::Countdown { remaining_seconds } => {
+                validate_lobby_countdown_seconds(remaining_seconds)
+                    .context("coordinated lobby returned an invalid countdown")?;
+                Ok(Some(RemoteLobbyEvent::Countdown { remaining_seconds }))
+            }
+            ServerLobbyMessage::CountdownCancelled => {
+                Ok(Some(RemoteLobbyEvent::CountdownCancelled))
+            }
+            ServerLobbyMessage::Start => Ok(Some(RemoteLobbyEvent::Start)),
             ServerLobbyMessage::Rejected { code } => {
                 bail!("coordinated lobby rejected the active session: {code:?}")
             }
@@ -164,27 +236,36 @@ async fn receive_server_message(socket: &mut LobbyWebSocket) -> Result<Option<Se
             return Ok(None);
         };
         let message = message.context("could not read coordinated lobby WebSocket")?;
+        if let Some(message) = handle_server_websocket_message(socket, message).await? {
+            return Ok(Some(message));
+        }
+    }
+}
 
-        match message {
-            Message::Text(text) => {
-                if text.len() > MAX_LOBBY_CONTROL_MESSAGE_BYTES {
-                    bail!("coordinated lobby message exceeds configured limit");
-                }
-                let message = serde_json::from_str::<ServerLobbyMessage>(&text)
-                    .context("could not decode coordinated lobby message")?;
-                return Ok(Some(message));
+async fn handle_server_websocket_message(
+    socket: &mut LobbyWebSocket,
+    message: Message,
+) -> Result<Option<ServerLobbyMessage>> {
+    match message {
+        Message::Text(text) => {
+            if text.len() > MAX_LOBBY_CONTROL_MESSAGE_BYTES {
+                bail!("coordinated lobby message exceeds configured limit");
             }
-            Message::Ping(payload) => {
-                socket
-                    .send(Message::Pong(payload))
-                    .await
-                    .context("could not send coordinated lobby pong")?;
-            }
-            Message::Pong(_) => {}
-            Message::Close(_) => return Ok(None),
-            Message::Binary(_) | Message::Frame(_) => {
-                bail!("coordinated lobby sent an unsupported WebSocket message")
-            }
+            let message = serde_json::from_str::<ServerLobbyMessage>(&text)
+                .context("could not decode coordinated lobby message")?;
+            Ok(Some(message))
+        }
+        Message::Ping(payload) => {
+            socket
+                .send(Message::Pong(payload))
+                .await
+                .context("could not send coordinated lobby pong")?;
+            Ok(None)
+        }
+        Message::Pong(_) => Ok(None),
+        Message::Close(_) => Ok(None),
+        Message::Binary(_) | Message::Frame(_) => {
+            bail!("coordinated lobby sent an unsupported WebSocket message")
         }
     }
 }
@@ -314,12 +395,14 @@ mod tests {
     ) -> LobbyRoster {
         timeout(Duration::from_secs(2), async {
             loop {
-                let roster = session
-                    .next_roster()
+                let event = session
+                    .next_event()
                     .await
-                    .expect("roster update should be valid")
+                    .expect("lobby event should be valid")
                     .expect("session should remain connected");
-                if roster.players.len() == expected_count {
+                if let RemoteLobbyEvent::Roster(roster) = event
+                    && roster.players.len() == expected_count
+                {
                     return roster;
                 }
             }

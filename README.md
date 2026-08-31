@@ -16,17 +16,22 @@ Primul vertical slice implementează:
 - descriptor LAN verificat pentru `Maps\Download\DotA_v6_89Q.w3x`;
 - un frame reader W3GS incremental și validarea sigură a `REQJOIN`;
 - răspunsurile W3GS necesare intrării în lobby și sincronizarea live a roster-ului;
+- un host virtual `Strajer` în slotul `HOSTBOT`, separat de cele 10 sloturi umane;
+- confirmare de hartă per client și countdown server-side de 60 secunde, cu mesaj
+  W3GS la fiecare 10 secunde, anulare la leave și tranziție sincronă spre loading;
 - stocare de hartă read-only pe server, download HTTPS autentificat, cache local
   verificat și transfer W3GS către Warcraft când harta lipsește;
-- un `Strajer.app` nativ SwiftUI cu iconiță în menu bar, status și agent Rust inclus.
+- un `Strajer.app` nativ SwiftUI cu iconiță în menu bar, status, nickname persistent
+  și agent Rust inclus.
 
-Intrarea în lobby, sincronizarea join/leave și pipeline-ul de map download sunt
-implementate. Pornirea jocului, transportul action-urilor și replay-ul sunt
-milestone-uri ulterioare. Harta nu mai trebuie preinstalată pe Mac: serverul o
+Intrarea în lobby, sincronizarea join/leave, pipeline-ul de map download și
+tranziția autoritativă lobby -> countdown -> loading sunt implementate.
+Transportul action-urilor, sincronizarea loading-ului uman, leave/lag in-game și
+replay-ul sunt milestone-ul următor. Harta nu mai trebuie preinstalată pe Mac: serverul o
 distribuie agentului, iar agentul o livrează către Warcraft prin protocolul W3GS.
-Validarea runtime a transferului cu Reforged pe Mac-ul fără hartă rămâne
-obligatorie înainte de a considera fluxul închis. Strajer nu modifică Warcraft III
-și nu publică jocuri în catalogul Battle.net.
+Strajer nu modifică binarul sau arhiva CASC Warcraft III și nu publică jocuri în
+catalogul Battle.net. Pentru regresia offline Reforged, aplicația instalează un
+override WebUI local, derivat și verificat din versiunea instalată pe același Mac.
 
 ## Dezvoltare locală
 
@@ -82,4 +87,5 @@ producție.
 - [Validarea milestone-ului M0](docs/validation-m0.md)
 - [Instalare pe alt Mac](docs/install-macos.md)
 - [Deploy Linux și Nginx Proxy Manager](docs/deploy-linux.md)
+- [Review și gate-uri de producție](docs/production-review.md)
 - [Notificări third-party](THIRD_PARTY_NOTICES.md)

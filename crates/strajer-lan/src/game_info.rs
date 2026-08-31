@@ -7,7 +7,6 @@ use crate::LanError;
 
 const DEFAULT_GAME_SETTING_FLAGS: u32 = 0x0006_7802;
 const GAME_FLAGS_OBSERVERS_FULL: u32 = 0x0010_0000;
-const HOST_NAME: &str = "Strajer";
 
 #[derive(Clone, PartialEq, Message)]
 struct GameInfoEntry {
@@ -84,7 +83,7 @@ fn encode_game_data(lobby: &LobbyDescriptor, local_port: u16) -> Result<Vec<u8>,
 fn encode_game_settings(lobby: &LobbyDescriptor) -> Result<Vec<u8>, LanError> {
     let map_sha1 = lobby.map.sha1_bytes()?;
     let map_path = lobby.map.path.replace('\\', "/");
-    let mut settings = Vec::with_capacity(map_path.len() + HOST_NAME.len() + 36);
+    let mut settings = Vec::with_capacity(map_path.len() + lobby.virtual_host.name.len() + 36);
 
     settings.extend_from_slice(&DEFAULT_GAME_SETTING_FLAGS.to_le_bytes());
     settings.push(0);
@@ -92,7 +91,7 @@ fn encode_game_settings(lobby: &LobbyDescriptor) -> Result<Vec<u8>, LanError> {
     settings.extend_from_slice(&lobby.map.height.to_le_bytes());
     settings.extend_from_slice(&lobby.map.checksum.to_le_bytes());
     push_c_string(&mut settings, &map_path);
-    push_c_string(&mut settings, HOST_NAME);
+    push_c_string(&mut settings, &lobby.virtual_host.name);
     settings.push(0);
     settings.extend_from_slice(&map_sha1);
 
@@ -133,8 +132,8 @@ mod tests {
     use std::collections::HashMap;
 
     use strajer_protocol::{
-        DEFAULT_WARCRAFT_PRODUCT, DEFAULT_WARCRAFT_VERSION, LobbyDescriptor, MapDescriptor,
-        PlayerCount, WarcraftDescriptor,
+        DEFAULT_WARCRAFT_PRODUCT, DEFAULT_WARCRAFT_VERSION, LobbyDescriptor, LobbyPlayer,
+        MapDescriptor, PlayerCount, WarcraftDescriptor,
     };
 
     use super::*;
@@ -233,6 +232,11 @@ mod tests {
             players: PlayerCount {
                 current: 1,
                 max: 24,
+            },
+            virtual_host: LobbyPlayer {
+                player_id: 24,
+                slot_index: 23,
+                name: "Strajer".to_owned(),
             },
         }
     }

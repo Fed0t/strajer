@@ -7,6 +7,7 @@ use crate::{Frame, FrameError};
 
 pub const PLAYER_INFO_PACKET_ID: u8 = 0x06;
 pub const PLAYER_LEAVE_OTHERS_PACKET_ID: u8 = 0x07;
+pub const GAME_LOADED_OTHERS_PACKET_ID: u8 = 0x08;
 pub const MAX_CLASSIC_PLAYER_NAME_BYTES: usize = 15;
 const PLAYER_JOIN_COUNTER: u32 = 1;
 const PLAYER_LEAVE_LOBBY_CODE: u32 = 13;
@@ -39,6 +40,14 @@ pub fn player_leave_others_frame(player_id: u8) -> Result<Frame, PlayerFrameErro
     payload.push(player_id);
     payload.extend_from_slice(&PLAYER_LEAVE_LOBBY_CODE.to_le_bytes());
     Ok(Frame::new(PLAYER_LEAVE_OTHERS_PACKET_ID, payload)?)
+}
+
+pub fn game_loaded_others_frame(player_id: u8) -> Result<Frame, PlayerFrameError> {
+    if player_id == 0 {
+        return Err(PlayerFrameError::InvalidPlayerId);
+    }
+
+    Ok(Frame::new(GAME_LOADED_OTHERS_PACKET_ID, vec![player_id])?)
 }
 
 fn validate_player(player_id: u8, player_name: &str) -> Result<(), PlayerFrameError> {
@@ -94,6 +103,13 @@ mod tests {
 
         assert_eq!(frame.packet_id(), PLAYER_LEAVE_OTHERS_PACKET_ID);
         assert_eq!(frame.payload(), &[2, 13, 0, 0, 0]);
+    }
+
+    #[test]
+    fn marks_the_virtual_host_as_loaded() {
+        let frame = game_loaded_others_frame(11).expect("loaded frame should encode");
+
+        assert_eq!(frame.to_bytes(), [0xF7, 0x08, 5, 0, 11]);
     }
 
     #[test]

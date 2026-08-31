@@ -36,10 +36,34 @@ shasum -a 256 -c Strajer-0.1.0-macos-universal.zip.sha256
 2. Mută `Strajer.app` în `Applications`.
 3. La prima pornire folosește `Right click → Open`, apoi confirmă `Open`.
 4. Acceptă permisiunea `Local Network` dacă macOS o cere.
-5. Iconița shield apare în menu bar; meniul trebuie să afișeze `Connected` și numărul de jocuri.
-6. Pornește Warcraft III normal și intră în `Local Area Network`.
-7. Ambii jucători aleg `Strajer Test #1`; după join trebuie să apară `2/11` și
-   ambele nume în sloturi.
+5. Iconița shield apare în menu bar; meniul trebuie să afișeze `Connected` si
+   `Offline LAN fix: Ready` sau `Offline LAN fix: Start Warcraft once`.
+6. Optional, seteaza numele din `Nickname...`. Daca il completezi prima data in
+   dialogul Warcraft, Strajer il salveaza automat pentru join-urile urmatoare.
+7. Daca meniul cere pornirea Warcraft, porneste jocul o data. Strajer citeste
+   `GlueManager.js` direct din instanta Warcraft locala, valideaza semnatura
+   versiunii si instaleaza automat override-ul compatibil.
+8. Cand meniul afiseaza `Offline LAN fix: Restart Warcraft once`, inchide complet
+   Warcraft si porneste-l din nou. Acest restart este necesar numai dupa prima
+   instalare a fixului.
+9. Verifica `Offline LAN fix: Ready`, apoi intra in `Local Area Network`.
+10. Ambii jucători aleg `Strajer Test #1`; după join trebuie să apară `3/11`:
+    cele doua nume umane plus `Strajer` in slotul `HOSTBOT`.
+
+Strajer activeaza automat preferinta Warcraft `Allow Local Files`. Bundle-ul nu
+contine si nu redistribuie fisiere Blizzard: patch-ul este derivat din versiunea
+Warcraft instalata pe acelasi Mac si schimba numai cele patru apeluri offline
+afectate plus cele sapte valori initiale de nickname. Arhiva CASC originala
+ramane nemodificata. Daca semnatura WebUI nu este
+recunoscuta, Strajer nu suprascrie fisierul si afiseaza `Unavailable`.
+
+Pentru rollback, inchide ambele aplicatii, sterge numai override-ul
+`_retail_/webui/GlueManager.js` si fisierul
+`_retail_/webui/strajer-config.json`, apoi elimina preferinta cu:
+
+```bash
+defaults delete 'com.blizzard.Warcraft III' 'Allow Local Files'
+```
 
 Harta nu trebuie copiată manual pe al doilea Mac. Agentul verifică mai întâi o
 copie locală existentă, apoi cache-ul Strajer, iar la nevoie descarcă asset-ul

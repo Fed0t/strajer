@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use strajer_protocol::{
     CATALOG_SCHEMA_VERSION, DEFAULT_WARCRAFT_PRODUCT, DEFAULT_WARCRAFT_VERSION, LobbyCatalog,
-    LobbyDescriptor, MapDescriptor, PlayerCount, ValidationError, WarcraftDescriptor,
+    LobbyDescriptor, LobbyPlayer, MapDescriptor, PlayerCount, ValidationError, WarcraftDescriptor,
 };
 use subtle::ConstantTimeEq;
 
@@ -67,6 +67,11 @@ impl AppState {
                 players: PlayerCount {
                     current: 1,
                     max: DOTA_PLAYER_SLOTS,
+                },
+                virtual_host: LobbyPlayer {
+                    player_id: DOTA_PLAYER_SLOTS,
+                    slot_index: DOTA_PLAYER_SLOTS - 1,
+                    name: "Strajer".to_owned(),
                 },
             }],
         };

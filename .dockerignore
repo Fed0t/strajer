@@ -1,9 +1,12 @@
 .git
 .gitignore
+.env
+.env.*
+!.env.example
 .DS_Store
 target
 dist
 maps
 *.log
-.env
-.env.*
+xcuserdata
+*.xcuserstate

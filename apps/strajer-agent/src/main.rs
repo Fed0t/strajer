@@ -3,24 +3,26 @@ mod remote_lobby;
 
 use std::env;
 use std::io::{self, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use local_map::MapCache;
-use remote_lobby::RemoteLobbySession;
+use remote_lobby::{RemoteLobbyEvent, RemoteLobbySession};
 use reqwest::Client;
 use serde::Serialize;
+use socket2::{Domain, Protocol, Socket, Type};
 use strajer_lan::PublishedLobby;
 use strajer_protocol::{LobbyCatalog, LobbyDescriptor, LobbyPlayer, LobbyRoster};
 use strajer_w3gs::{
     CHAT_TO_HOST_PACKET_ID, Frame, FrameReader, LEAVE_REQUEST_PACKET_ID, MAP_PART_DATA_BYTES,
     MAP_PART_NOT_OK_PACKET_ID, MAP_PART_OK_PACKET_ID, MAP_SIZE_PACKET_ID, MapCheck, MapPartAck,
     MapSize, PONG_TO_HOST_PACKET_ID, PROTOBUF_PACKET_ID, ProtobufEnvelope, RACE_HUMAN,
-    RACE_NIGHT_ELF, RACE_UNDEAD, ReqJoin, SlotData, SlotInfo, SlotLayout, leave_ack,
-    map_part_frame, ping_from_host, player_info_frame, player_leave_others_frame,
-    player_profile_frame, player_skins_frame, start_download_frame,
+    RACE_NIGHT_ELF, RACE_UNDEAD, ReqJoin, SlotData, SlotInfo, SlotLayout, chat_from_host,
+    countdown_end, countdown_start, game_loaded_others_frame, leave_ack, map_part_frame,
+    ping_from_host, player_info_frame, player_leave_others_frame, player_profile_frame,
+    player_skins_frame, start_download_frame,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -40,11 +42,14 @@ const MAP_TRANSFER_WINDOW_PARTS: u32 = 100;
 const MAP_PREPARATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAP_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAP_TRANSFER_TOTAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const LOBBY_LISTENER_BACKLOG: i32 = 128;
+const LOBBY_BIND_ATTEMPTS: usize = 16;
 const DOTA_MAP_PATH: &str = "Maps\\Download\\DotA_v6_89Q.w3x";
-const DOTA_PLAYER_SLOTS: u8 = 11;
+const DOTA_TOTAL_PLAYER_SLOTS: u8 = 11;
+const DOTA_HUMAN_PLAYER_SLOTS: u8 = 10;
 const MINIMUM_JOIN_TOKEN_BYTES: usize = 32;
 const MAXIMUM_JOIN_TOKEN_BYTES: usize = 128;
-const DOTA_SLOT_TOPOLOGY: [(u8, u8, u8); DOTA_PLAYER_SLOTS as usize] = [
+const DOTA_SLOT_TOPOLOGY: [(u8, u8, u8); DOTA_TOTAL_PLAYER_SLOTS as usize] = [
     (0, 1, RACE_NIGHT_ELF),
     (0, 2, RACE_NIGHT_ELF),
     (0, 3, RACE_NIGHT_ELF),
@@ -65,6 +70,8 @@ struct AgentStatusEvent {
     lobby_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lobby_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nickname: Option<String>,
 }
 
 impl AgentStatusEvent {
@@ -73,6 +80,7 @@ impl AgentStatusEvent {
             event: "ready",
             lobby_count: Some(lobby_count),
             lobby_id: None,
+            nickname: None,
         }
     }
 
@@ -81,6 +89,7 @@ impl AgentStatusEvent {
             event: "join_request_captured",
             lobby_count: None,
             lobby_id: Some(lobby_id.to_owned()),
+            nickname: None,
         }
     }
 
@@ -89,6 +98,16 @@ impl AgentStatusEvent {
             event: "lobby_joined",
             lobby_count: None,
             lobby_id: Some(lobby_id.to_owned()),
+            nickname: None,
+        }
+    }
+
+    fn nickname_captured(nickname: &str) -> Self {
+        Self {
+            event: "nickname_captured",
+            lobby_count: None,
+            lobby_id: None,
+            nickname: Some(nickname.to_owned()),
         }
     }
 }
@@ -135,12 +154,18 @@ impl LobbySessionConfig {
             slot_info.frame()?,
         ];
 
+        frames.push(player_info(&self.lobby.virtual_host)?);
         for player in remote_players(roster, assigned_player_id) {
             frames.push(player_info(player)?);
         }
+        frames.push(player_skins_frame(self.lobby.virtual_host.player_id)?);
         for player in remote_players(roster, assigned_player_id) {
             frames.push(player_skins_frame(player.player_id)?);
         }
+        frames.push(player_profile_frame(
+            self.lobby.virtual_host.player_id,
+            self.lobby.virtual_host.name.clone(),
+        )?);
         for player in &roster.players {
             frames.push(player_profile_frame(player.player_id, player.name.clone())?);
         }
@@ -333,20 +358,17 @@ async fn activate_lobby(
         join_token,
         lobby.clone(),
     )?);
-    let listener = TcpListener::bind(("0.0.0.0", 0))
-        .await
+    let listeners = bind_lobby_listeners()
         .with_context(|| format!("could not bind local listener for lobby {}", lobby.id))?;
-    let local_address = listener
-        .local_addr()
-        .with_context(|| format!("could not inspect local listener for lobby {}", lobby.id))?;
-    let publisher = PublishedLobby::publish(&lobby, local_address.port())
+    let local_port = listeners.local_port();
+    let publisher = PublishedLobby::publish(&lobby, local_port)
         .await
         .with_context(|| format!("could not publish lobby {}", lobby.id))?;
 
     info!(
         lobby_id = %lobby.id,
         game_name = %lobby.name,
-        local_port = local_address.port(),
+        local_port,
         map_size = session_config.map_cache.file_size(),
         map_crc32 = session_config.map_cache.file_crc32(),
         "published Warcraft LAN lobby"
@@ -363,16 +385,99 @@ async fn activate_lobby(
         }
     });
 
-    let listener_task = tokio::spawn(accept_connections(session_config, listener));
+    let listener_task = tokio::spawn(accept_connections(session_config, listeners));
     Ok((publisher, listener_task))
 }
 
-async fn accept_connections(config: Arc<LobbySessionConfig>, listener: TcpListener) -> Result<()> {
+struct LocalLobbyListeners {
+    ipv4: TcpListener,
+    ipv6: TcpListener,
+    local_port: u16,
+}
+
+impl LocalLobbyListeners {
+    fn local_port(&self) -> u16 {
+        self.local_port
+    }
+
+    async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        tokio::select! {
+            accepted = self.ipv4.accept() => accepted,
+            accepted = self.ipv6.accept() => accepted,
+        }
+    }
+}
+
+fn bind_lobby_listeners() -> Result<LocalLobbyListeners> {
+    let mut last_ipv6_error = None;
+
+    for _ in 0..LOBBY_BIND_ATTEMPTS {
+        let ipv4 = bind_loopback_socket(
+            Domain::IPV4,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            false,
+        )
+        .context("could not bind IPv4 loopback lobby socket")?;
+        let local_port = ipv4
+            .local_addr()
+            .context("could not inspect IPv4 loopback lobby socket")?
+            .as_socket()
+            .context("IPv4 loopback lobby socket returned a non-IP address")?
+            .port();
+
+        let ipv6 = match bind_loopback_socket(
+            Domain::IPV6,
+            SocketAddr::from((Ipv6Addr::LOCALHOST, local_port)),
+            true,
+        ) {
+            Ok(socket) => socket,
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                last_ipv6_error = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error).context("could not bind IPv6 loopback lobby socket"),
+        };
+
+        let ipv4: std::net::TcpListener = ipv4.into();
+        let ipv6: std::net::TcpListener = ipv6.into();
+        return Ok(LocalLobbyListeners {
+            ipv4: TcpListener::from_std(ipv4)
+                .context("could not register IPv4 lobby socket with Tokio")?,
+            ipv6: TcpListener::from_std(ipv6)
+                .context("could not register IPv6 lobby socket with Tokio")?,
+            local_port,
+        });
+    }
+
+    Err(last_ipv6_error
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrInUse, "no loopback port available")))
+    .context("could not reserve one loopback port for IPv4 and IPv6")
+}
+
+fn bind_loopback_socket(
+    domain: Domain,
+    address: SocketAddr,
+    only_ipv6: bool,
+) -> io::Result<Socket> {
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if domain == Domain::IPV6 {
+        socket.set_only_v6(only_ipv6)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(LOBBY_LISTENER_BACKLOG)?;
+    Ok(socket)
+}
+
+async fn accept_connections(
+    config: Arc<LobbySessionConfig>,
+    listeners: LocalLobbyListeners,
+) -> Result<()> {
     let frame_reader = FrameReader::new(MAX_INITIAL_JOIN_FRAME_BYTES)
         .context("invalid initial W3GS frame limit")?;
 
     loop {
-        let (stream, peer_address) = listener
+        let (stream, peer_address) = listeners
             .accept()
             .await
             .with_context(|| format!("listener failed for lobby {}", config.lobby.id))?;
@@ -413,9 +518,9 @@ async fn serve_join_connection(
         tail_bytes = request.tail().len(),
         "accepted valid W3GS_REQJOIN"
     );
-    emit_status_event(&AgentStatusEvent::join_request_captured(lobby_id))?;
-
     let player_name = decode_player_name(&request)?;
+    emit_status_event(&AgentStatusEvent::nickname_captured(&player_name))?;
+    emit_status_event(&AgentStatusEvent::join_request_captured(lobby_id))?;
     let remote_session = RemoteLobbySession::connect(
         &config.server_url,
         &config.lobby,
@@ -469,7 +574,16 @@ fn validate_join_request(lobby: &LobbyDescriptor, request: &ReqJoin) -> Result<(
 fn ipv4_peer_address(address: SocketAddr) -> Result<SocketAddrV4> {
     match address {
         SocketAddr::V4(address) => Ok(address),
-        SocketAddr::V6(_) => bail!("Warcraft W3GS IPv6 connections are not supported"),
+        SocketAddr::V6(address) => {
+            if let Some(ipv4) = address.ip().to_ipv4_mapped() {
+                return Ok(SocketAddrV4::new(ipv4, address.port()));
+            }
+            if address.ip().is_loopback() {
+                return Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port()));
+            }
+
+            bail!("non-local Warcraft W3GS IPv6 connections are not supported")
+        }
     }
 }
 
@@ -506,13 +620,8 @@ async fn run_lobby_session(
         session_started_at + MAP_TRANSFER_INTERVAL,
         MAP_TRANSFER_INTERVAL,
     );
-    let map_host_player_id = roster
-        .players
-        .iter()
-        .map(|player| player.player_id)
-        .min()
-        .unwrap_or(assigned_player_id);
     let mut map_transfer = MapTransferState::AwaitingStatus;
+    let mut game_started = false;
 
     loop {
         tokio::select! {
@@ -527,8 +636,8 @@ async fn run_lobby_session(
                     &mut stream,
                     frame,
                     &mut map_transfer,
-                    map_host_player_id,
                     assigned_player_id,
+                    &mut remote_session,
                 )
                 .await?
                 {
@@ -544,35 +653,102 @@ async fn run_lobby_session(
             _ = map_transfer_interval.tick() => {
                 advance_map_transfer(&config, &mut stream, &mut map_transfer).await?;
             }
-            roster_update = remote_session.next_roster() => {
-                let Some(next_roster) = roster_update? else {
+            remote_event = remote_session.next_event() => {
+                let Some(remote_event) = remote_event? else {
                     bail!("coordinated lobby connection closed");
                 };
-                if next_roster.revision <= roster.revision {
-                    continue;
-                }
-                if next_roster.player(assigned_player_id).is_none() {
-                    bail!("coordinated lobby roster removed the local player");
-                }
+                match remote_event {
+                    RemoteLobbyEvent::Roster(next_roster) => {
+                        if next_roster.revision <= roster.revision {
+                            continue;
+                        }
+                        if next_roster.player(assigned_player_id).is_none() {
+                            bail!("coordinated lobby roster removed the local player");
+                        }
 
-                apply_roster_update(
-                    &config.lobby,
-                    &mut stream,
-                    assigned_player_id,
-                    &roster,
-                    &next_roster,
-                )
-                .await?;
-                info!(
-                    lobby_id = %config.lobby.id,
-                    roster_revision = next_roster.revision,
-                    player_count = next_roster.players.len(),
-                    "synchronized W3GS lobby roster"
-                );
-                roster = next_roster;
+                        apply_roster_update(
+                            &config.lobby,
+                            &mut stream,
+                            assigned_player_id,
+                            &roster,
+                            &next_roster,
+                        )
+                        .await?;
+                        info!(
+                            lobby_id = %config.lobby.id,
+                            roster_revision = next_roster.revision,
+                            player_count = next_roster.players.len(),
+                            "synchronized W3GS lobby roster"
+                        );
+                        roster = next_roster;
+                    }
+                    RemoteLobbyEvent::Countdown { remaining_seconds } => {
+                        send_virtual_host_chat(
+                            &config.lobby,
+                            &mut stream,
+                            &roster,
+                            &format!("Game starts in {remaining_seconds} seconds."),
+                        )
+                        .await?;
+                        info!(
+                            lobby_id = %config.lobby.id,
+                            remaining_seconds,
+                            "published automatic start countdown in Warcraft chat"
+                        );
+                    }
+                    RemoteLobbyEvent::CountdownCancelled => {
+                        send_virtual_host_chat(
+                            &config.lobby,
+                            &mut stream,
+                            &roster,
+                            "Countdown cancelled: a player left the lobby.",
+                        )
+                        .await?;
+                        info!(
+                            lobby_id = %config.lobby.id,
+                            "cancelled automatic start countdown"
+                        );
+                    }
+                    RemoteLobbyEvent::Start => {
+                        if game_started {
+                            bail!("coordinated lobby sent duplicate game start");
+                        }
+                        send_game_start(&config.lobby, &mut stream).await?;
+                        game_started = true;
+                        info!(
+                            lobby_id = %config.lobby.id,
+                            "sent W3GS game start sequence"
+                        );
+                    }
+                }
             }
         }
     }
+}
+
+async fn send_virtual_host_chat(
+    lobby: &LobbyDescriptor,
+    stream: &mut TcpStream,
+    roster: &LobbyRoster,
+    message: &str,
+) -> Result<()> {
+    let recipients = roster
+        .players
+        .iter()
+        .map(|player| player.player_id)
+        .collect::<Vec<_>>();
+    let frame = chat_from_host(lobby.virtual_host.player_id, &recipients, message)?;
+    write_frame(stream, &frame).await
+}
+
+async fn send_game_start(lobby: &LobbyDescriptor, stream: &mut TcpStream) -> Result<()> {
+    write_frame(stream, &countdown_start()?).await?;
+    write_frame(stream, &countdown_end()?).await?;
+    write_frame(
+        stream,
+        &game_loaded_others_frame(lobby.virtual_host.player_id)?,
+    )
+    .await
 }
 
 async fn apply_roster_update(
@@ -629,20 +805,17 @@ async fn handle_lobby_frame(
     stream: &mut TcpStream,
     frame: Frame,
     map_transfer: &mut MapTransferState,
-    map_host_player_id: u8,
     assigned_player_id: u8,
+    remote_session: &mut RemoteLobbySession,
 ) -> Result<bool> {
     match frame.packet_id() {
         MAP_SIZE_PACKET_ID => {
-            handle_map_size(
-                config,
-                stream,
-                &frame,
-                map_transfer,
-                map_host_player_id,
-                assigned_player_id,
-            )
-            .await?;
+            let became_ready =
+                handle_map_size(config, stream, &frame, map_transfer, assigned_player_id).await?;
+            if became_ready {
+                remote_session.mark_ready().await?;
+                emit_status_event(&AgentStatusEvent::lobby_joined(&config.lobby.id))?;
+            }
         }
         MAP_PART_OK_PACKET_ID => match MapPartAck::decode(&frame) {
             Ok(acknowledgement) => {
@@ -711,9 +884,8 @@ async fn handle_map_size(
     stream: &mut TcpStream,
     frame: &Frame,
     map_transfer: &mut MapTransferState,
-    map_host_player_id: u8,
     assigned_player_id: u8,
-) -> Result<()> {
+) -> Result<bool> {
     let map_size = MapSize::decode(frame)?;
     let expected_size = config.map_cache.file_size();
     if map_size.has_map() && map_size.map_size() == expected_size {
@@ -728,9 +900,8 @@ async fn handle_map_size(
                 map_size = map_size.map_size(),
                 "Warcraft entered the local lobby with the verified map"
             );
-            emit_status_event(&AgentStatusEvent::lobby_joined(&config.lobby.id))?;
         }
-        return Ok(());
+        return Ok(!was_verified);
     }
 
     if map_size.map_size() > expected_size {
@@ -750,10 +921,14 @@ async fn handle_map_size(
         MapTransferState::AwaitingStatus => {
             let map_cache = config.map_cache.clone();
             let task = tokio::spawn(async move { map_cache.load().await });
-            write_frame(stream, &start_download_frame(map_host_player_id)?).await?;
+            write_frame(
+                stream,
+                &start_download_frame(config.lobby.virtual_host.player_id)?,
+            )
+            .await?;
             *map_transfer = MapTransferState::Preparing(PreparingMapTransfer {
                 task,
-                from_player_id: map_host_player_id,
+                from_player_id: config.lobby.virtual_host.player_id,
                 to_player_id: assigned_player_id,
                 started_at: Instant::now(),
             });
@@ -782,7 +957,7 @@ async fn handle_map_size(
         }
     }
 
-    Ok(())
+    Ok(false)
 }
 
 async fn advance_map_transfer(
@@ -842,19 +1017,30 @@ fn build_dota_slot_info(lobby: &LobbyDescriptor, roster: &LobbyRoster) -> Result
         bail!("no W3GS slot topology is configured for {}", lobby.map.path);
     }
 
-    if lobby.players.max != DOTA_PLAYER_SLOTS {
+    if lobby.players.max != DOTA_TOTAL_PLAYER_SLOTS
+        || lobby.human_player_capacity() != DOTA_HUMAN_PLAYER_SLOTS
+        || lobby.virtual_host.player_id != DOTA_TOTAL_PLAYER_SLOTS
+        || lobby.virtual_host.slot_index != DOTA_HUMAN_PLAYER_SLOTS
+    {
         bail!(
-            "DotA coordinated lobby requires {DOTA_PLAYER_SLOTS} slots, got {}",
+            "DotA coordinated lobby requires {DOTA_HUMAN_PLAYER_SLOTS} human slots plus the final Strajer host slot, got {} total slots",
             lobby.players.max,
         );
     }
     roster
-        .validate(DOTA_PLAYER_SLOTS)
+        .validate(DOTA_HUMAN_PLAYER_SLOTS)
         .context("cannot build W3GS slots from invalid roster")?;
 
     let mut slots = Vec::with_capacity(DOTA_SLOT_TOPOLOGY.len());
     for (index, &(team, color, race)) in DOTA_SLOT_TOPOLOGY.iter().enumerate() {
-        if let Some(player) = roster
+        if usize::from(lobby.virtual_host.slot_index) == index {
+            slots.push(SlotData::occupied_human(
+                lobby.virtual_host.player_id,
+                team,
+                color,
+                race,
+            ));
+        } else if let Some(player) = roster
             .players
             .iter()
             .find(|player| usize::from(player.slot_index) == index)
@@ -874,7 +1060,7 @@ fn build_dota_slot_info(lobby: &LobbyDescriptor, roster: &LobbyRoster) -> Result
         slots,
         lobby_random_seed(lobby),
         SlotLayout::CustomForcesFixedPlayerSettings,
-        DOTA_PLAYER_SLOTS,
+        DOTA_TOTAL_PLAYER_SLOTS,
     )?)
 }
 
@@ -980,6 +1166,59 @@ mod tests {
     static MAP_FLOW_TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[tokio::test]
+    async fn lobby_listener_accepts_ipv4_and_ipv6_loopback() {
+        let listeners = bind_lobby_listeners().expect("loopback lobby listeners should bind");
+        let port = listeners.local_port();
+
+        let ipv4_client = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            .await
+            .expect("IPv4 Warcraft client should connect");
+        let (_, ipv4_peer) = listeners
+            .accept()
+            .await
+            .expect("lobby listener should accept IPv4");
+        assert_eq!(
+            ipv4_peer_address(ipv4_peer)
+                .expect("IPv4-mapped peer should convert")
+                .ip(),
+            &Ipv4Addr::LOCALHOST
+        );
+        drop(ipv4_client);
+
+        let ipv6_client = TcpStream::connect(SocketAddr::from((Ipv6Addr::LOCALHOST, port)))
+            .await
+            .expect("IPv6 Warcraft client should connect");
+        let (_, ipv6_peer) = listeners
+            .accept()
+            .await
+            .expect("lobby listener should accept IPv6");
+        assert_eq!(
+            ipv4_peer_address(ipv6_peer)
+                .expect("IPv6 loopback peer should convert")
+                .ip(),
+            &Ipv4Addr::LOCALHOST
+        );
+        drop(ipv6_client);
+
+        assert_eq!(
+            listeners
+                .ipv4
+                .local_addr()
+                .expect("IPv4 listener address should exist")
+                .ip(),
+            Ipv4Addr::LOCALHOST
+        );
+        assert_eq!(
+            listeners
+                .ipv6
+                .local_addr()
+                .expect("IPv6 listener address should exist")
+                .ip(),
+            Ipv6Addr::LOCALHOST
+        );
+    }
+
+    #[tokio::test]
     async fn downloads_and_transfers_a_missing_map_without_a_warcraft_copy() {
         let http_listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -1039,7 +1278,12 @@ mod tests {
                 map,
                 players: PlayerCount {
                     current: 1,
-                    max: DOTA_PLAYER_SLOTS,
+                    max: DOTA_TOTAL_PLAYER_SLOTS,
+                },
+                virtual_host: LobbyPlayer {
+                    player_id: DOTA_TOTAL_PLAYER_SLOTS,
+                    slot_index: DOTA_HUMAN_PLAYER_SLOTS,
+                    name: "Strajer".to_owned(),
                 },
             },
             map_cache,
@@ -1064,16 +1308,16 @@ mod tests {
         let mut client_stream = client_task.await.expect("client task should finish");
         let mut transfer = MapTransferState::AwaitingStatus;
 
-        handle_map_size(
+        let became_ready = handle_map_size(
             &config,
             &mut server_stream,
             &test_map_size_frame(1, 0),
             &mut transfer,
-            1,
             2,
         )
         .await
         .expect("missing map should start a transfer");
+        assert!(!became_ready);
         let reader = FrameReader::new(4_096).expect("test frame reader should build");
         let start = reader
             .read_next(&mut client_stream)
@@ -1081,6 +1325,7 @@ mod tests {
             .expect("start download should read")
             .expect("start download should exist");
         assert_eq!(start.packet_id(), strajer_w3gs::START_DOWNLOAD_PACKET_ID);
+        assert_eq!(start.payload().last(), Some(&DOTA_TOTAL_PLAYER_SLOTS));
 
         let mut transfer_started = false;
         for _ in 0..200 {
@@ -1103,26 +1348,26 @@ mod tests {
         assert_eq!(part.packet_id(), strajer_w3gs::MAP_PART_PACKET_ID);
         assert_eq!(&part.payload()[14..], b"123456789");
 
-        handle_map_size(
+        let became_ready = handle_map_size(
             &config,
             &mut server_stream,
             &test_map_size_frame(3, 9),
             &mut transfer,
-            1,
             2,
         )
         .await
         .expect("map progress should apply");
-        handle_map_size(
+        assert!(!became_ready);
+        let became_ready = handle_map_size(
             &config,
             &mut server_stream,
             &test_map_size_frame(1, 9),
             &mut transfer,
-            1,
             2,
         )
         .await
         .expect("map verification should finish");
+        assert!(became_ready);
         assert!(matches!(transfer, MapTransferState::Verified));
         assert_eq!(
             fs::read(test_directory.join("maps").join(format!("{map_sha1}.w3x")))

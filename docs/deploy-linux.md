@@ -35,10 +35,12 @@ curl http://<linux-server-lan-ip>:18080/healthz
 curl http://<linux-server-lan-ip>:18080/v1/lobbies
 ```
 
-Catalogul nou trebuie să raporteze `"max":11`. Endpoint-ul
+Catalogul nou trebuie să raporteze `"current":1`, `"max":11` si
+`"virtual_host":{"player_id":11,"slot_index":10,"name":"Strajer"}`. Endpoint-ul
 `/v1/lobbies/synthetic-1/session` este WebSocket și necesită bearer token.
-Catalogul schema `2` include `file_size` și `file_crc32`; deploy-ul serverului și
-build-urile noi de client trebuie coordonate.
+Catalogul schema `3` si protocolul de sesiune `2` introduc host-ul virtual,
+`ready`, countdown si start; deploy-ul serverului și build-urile noi de client
+trebuie coordonate.
 
 ## Nginx Proxy Manager
 

@@ -25,7 +25,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 use crate::AppState;
-use crate::lobby::{LobbyJoinError, LobbyMembership, LobbyRoom};
+use crate::lobby::{LobbyJoinError, LobbyMembership, LobbyPhase, LobbyRoom, LobbyUpdate};
 
 const LOBBY_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -147,7 +147,21 @@ async fn serve_lobby_socket(mut socket: WebSocket, room: Arc<LobbyRoom>, lobby_i
         }
     };
 
-    let membership = match room.join(join_message.player_name().to_owned()).await {
+    let player_name = match join_message.join_player_name() {
+        Some(player_name) => player_name.to_owned(),
+        None => {
+            let _ = send_server_message(
+                &mut socket,
+                &ServerLobbyMessage::Rejected {
+                    code: LobbyJoinRejection::InvalidRequest,
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    let membership = match room.join(player_name).await {
         Ok(membership) => membership,
         Err(error) => {
             let rejection = map_join_error(&error);
@@ -196,7 +210,7 @@ async fn receive_join_message(
 
 async fn run_connected_lobby_socket(
     socket: &mut WebSocket,
-    room: &LobbyRoom,
+    room: &Arc<LobbyRoom>,
     mut membership: LobbyMembership,
 ) -> Result<()> {
     send_server_message(
@@ -218,21 +232,89 @@ async fn run_connected_lobby_socket(
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Close(_))) | None => return Ok(()),
-                    Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
-                        bail!("unexpected client message after lobby join");
+                    Some(Ok(Message::Text(text))) => {
+                        handle_active_agent_message(
+                            room,
+                            membership.player_id,
+                            membership.session_id,
+                            &text,
+                        )
+                        .await?;
+                    }
+                    Some(Ok(Message::Binary(_))) => {
+                        bail!("unexpected binary client message after lobby join");
                     }
                     Some(Err(error)) => return Err(error).context("could not read lobby WebSocket"),
                 }
             }
             update = membership.updates.recv() => {
-                let roster = match update {
-                    Ok(roster) => roster,
-                    Err(broadcast::error::RecvError::Lagged(_)) => room.snapshot().await,
+                let message = match update {
+                    Ok(LobbyUpdate::Roster(roster)) => ServerLobbyMessage::Roster { roster },
+                    Ok(LobbyUpdate::Countdown { remaining_seconds }) => {
+                        ServerLobbyMessage::Countdown { remaining_seconds }
+                    }
+                    Ok(LobbyUpdate::CountdownCancelled) => {
+                        ServerLobbyMessage::CountdownCancelled
+                    }
+                    Ok(LobbyUpdate::Start) => ServerLobbyMessage::Start,
+                    Err(broadcast::error::RecvError::Lagged(skipped_updates)) => {
+                        warn!(
+                            player_id = membership.player_id,
+                            skipped_updates,
+                            "lobby client lagged behind control updates; sending authoritative snapshot"
+                        );
+                        send_lobby_control_snapshot(socket, room).await?;
+                        continue;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 };
-                send_server_message(socket, &ServerLobbyMessage::Roster { roster }).await?;
+                send_server_message(socket, &message).await?;
             }
         }
+    }
+}
+
+async fn send_lobby_control_snapshot(socket: &mut WebSocket, room: &LobbyRoom) -> Result<()> {
+    let snapshot = room.control_snapshot().await;
+    send_server_message(
+        socket,
+        &ServerLobbyMessage::Roster {
+            roster: snapshot.roster,
+        },
+    )
+    .await?;
+
+    match snapshot.phase {
+        LobbyPhase::Waiting => Ok(()),
+        LobbyPhase::Countdown { remaining_seconds } => {
+            send_server_message(socket, &ServerLobbyMessage::Countdown { remaining_seconds }).await
+        }
+        LobbyPhase::Started => send_server_message(socket, &ServerLobbyMessage::Start).await,
+    }
+}
+
+async fn handle_active_agent_message(
+    room: &Arc<LobbyRoom>,
+    player_id: u8,
+    session_id: u64,
+    text: &str,
+) -> Result<()> {
+    if text.len() > MAX_LOBBY_CONTROL_MESSAGE_BYTES {
+        bail!("lobby client message exceeds configured limit");
+    }
+
+    let message = serde_json::from_str::<AgentLobbyMessage>(text)
+        .context("could not decode active lobby client message")?;
+    message
+        .validate()
+        .context("active lobby client message failed validation")?;
+
+    match message {
+        AgentLobbyMessage::Ready { .. } => room
+            .mark_ready(player_id, session_id)
+            .await
+            .context("could not mark lobby player ready"),
+        AgentLobbyMessage::Join { .. } => bail!("duplicate lobby join message"),
     }
 }
 
@@ -261,6 +343,7 @@ fn map_validation_error(error: LobbySessionValidationError) -> LobbyJoinRejectio
 fn map_join_error(error: &LobbyJoinError) -> LobbyJoinRejection {
     match error {
         LobbyJoinError::Full => LobbyJoinRejection::LobbyFull,
+        LobbyJoinError::Started => LobbyJoinRejection::LobbyStarted,
         LobbyJoinError::DuplicatePlayerName => LobbyJoinRejection::DuplicatePlayerName,
         LobbyJoinError::SessionIdExhausted => LobbyJoinRejection::InvalidRequest,
     }
@@ -327,7 +410,12 @@ mod tests {
         assert_eq!(catalog.lobbies[0].map.checksum, 448_311_427);
         assert_eq!(catalog.lobbies[0].map.width, 128);
         assert_eq!(catalog.lobbies[0].map.height, 128);
+        assert_eq!(catalog.lobbies[0].players.current, 1);
         assert_eq!(catalog.lobbies[0].players.max, 11);
+        assert_eq!(catalog.lobbies[0].human_player_capacity(), 10);
+        assert_eq!(catalog.lobbies[0].virtual_host.player_id, 11);
+        assert_eq!(catalog.lobbies[0].virtual_host.slot_index, 10);
+        assert_eq!(catalog.lobbies[0].virtual_host.name, "Strajer");
         assert_eq!(catalog.validate(), Ok(()));
     }
 
@@ -441,10 +529,50 @@ mod tests {
         server_task.abort();
     }
 
+    #[tokio::test]
+    async fn accepts_ready_and_publishes_the_initial_countdown() {
+        let mut catalog = AppState::synthetic_at(2_000, 2)
+            .expect("state should be valid")
+            .catalog()
+            .clone();
+        catalog.lobbies[0].players.max = 2;
+        catalog.lobbies[0].virtual_host.player_id = 2;
+        catalog.lobbies[0].virtual_host.slot_index = 1;
+        let state = AppState::from_catalog(catalog).expect("one-player state should be valid");
+        let (endpoint, server_task) = start_websocket_server_with_state(state).await;
+        let mut player = connect_lobby_client(&endpoint, "Ready#1000").await;
+        receive_joined(&mut player).await;
+
+        let ready =
+            serde_json::to_string(&AgentLobbyMessage::ready()).expect("ready should serialize");
+        player
+            .send(ClientMessage::Text(ready.into()))
+            .await
+            .expect("ready should send");
+
+        let countdown = timeout(Duration::from_secs(1), async {
+            loop {
+                if let ServerLobbyMessage::Countdown { remaining_seconds } =
+                    receive_control_message(&mut player).await
+                {
+                    return remaining_seconds;
+                }
+            }
+        })
+        .await
+        .expect("initial countdown should arrive");
+        assert_eq!(countdown, 60);
+        server_task.abort();
+    }
+
     type TestLobbySocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
     async fn start_websocket_server() -> (String, JoinHandle<()>) {
         let state = AppState::synthetic_at(2_000, 2).expect("state should be valid");
+        start_websocket_server_with_state(state).await
+    }
+
+    async fn start_websocket_server_with_state(state: AppState) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("test listener should bind");

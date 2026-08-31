@@ -3,10 +3,12 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CATALOG_SCHEMA_VERSION: u16 = 2;
+pub const CATALOG_SCHEMA_VERSION: u16 = 3;
 pub const DEFAULT_WARCRAFT_PRODUCT: &str = "W3XP";
 pub const DEFAULT_WARCRAFT_VERSION: &str = "2.0.4.23745";
-pub const LOBBY_SESSION_PROTOCOL_VERSION: u16 = 1;
+pub const LOBBY_SESSION_PROTOCOL_VERSION: u16 = 2;
+pub const LOBBY_COUNTDOWN_SECONDS: u8 = 60;
+pub const LOBBY_COUNTDOWN_STEP_SECONDS: u8 = 10;
 pub const MAX_LOBBY_CONTROL_MESSAGE_BYTES: usize = 4_096;
 pub const MAX_LOBBY_PLAYER_NAME_BYTES: usize = 15;
 pub const MAX_GAME_NAME_BYTES: usize = 31;
@@ -19,6 +21,9 @@ pub enum AgentLobbyMessage {
         protocol_version: u16,
         player_name: String,
     },
+    Ready {
+        protocol_version: u16,
+    },
 }
 
 impl AgentLobbyMessage {
@@ -30,6 +35,12 @@ impl AgentLobbyMessage {
         })
     }
 
+    pub fn ready() -> Self {
+        Self::Ready {
+            protocol_version: LOBBY_SESSION_PROTOCOL_VERSION,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), LobbySessionValidationError> {
         match self {
             Self::Join {
@@ -39,12 +50,16 @@ impl AgentLobbyMessage {
                 validate_lobby_session_protocol_version(*protocol_version)?;
                 validate_lobby_player_name(player_name)
             }
+            Self::Ready { protocol_version } => {
+                validate_lobby_session_protocol_version(*protocol_version)
+            }
         }
     }
 
-    pub fn player_name(&self) -> &str {
+    pub fn join_player_name(&self) -> Option<&str> {
         match self {
-            Self::Join { player_name, .. } => player_name,
+            Self::Join { player_name, .. } => Some(player_name),
+            Self::Ready { .. } => None,
         }
     }
 }
@@ -60,6 +75,11 @@ pub enum ServerLobbyMessage {
     Roster {
         roster: LobbyRoster,
     },
+    Countdown {
+        remaining_seconds: u8,
+    },
+    CountdownCancelled,
+    Start,
     Rejected {
         code: LobbyJoinRejection,
     },
@@ -72,6 +92,7 @@ pub enum LobbyJoinRejection {
     UnsupportedProtocol,
     InvalidPlayerName,
     LobbyFull,
+    LobbyStarted,
     DuplicatePlayerName,
 }
 
@@ -194,6 +215,7 @@ pub struct LobbyDescriptor {
     pub warcraft: WarcraftDescriptor,
     pub map: MapDescriptor,
     pub players: PlayerCount,
+    pub virtual_host: LobbyPlayer,
 }
 
 impl LobbyDescriptor {
@@ -213,7 +235,20 @@ impl LobbyDescriptor {
         self.map.validate()?;
         self.players.validate()?;
 
+        if self.players.current == 0
+            || self.players.max < 2
+            || self.virtual_host.player_id != self.players.max
+            || self.virtual_host.slot_index != self.players.max - 1
+            || validate_lobby_player_name(&self.virtual_host.name).is_err()
+        {
+            return Err(ValidationError::InvalidVirtualHost);
+        }
+
         Ok(())
+    }
+
+    pub fn human_player_capacity(&self) -> u8 {
+        self.players.max.saturating_sub(1)
     }
 }
 
@@ -315,6 +350,10 @@ pub enum ValidationError {
     InvalidMapSha1,
     #[error("invalid player count: {current}/{max}")]
     InvalidPlayerCount { current: u8, max: u8 },
+    #[error(
+        "virtual host must occupy the final player id and slot in a lobby with at least two slots"
+    )]
+    InvalidVirtualHost,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -337,6 +376,23 @@ pub enum LobbySessionValidationError {
     DuplicateRosterPlayerId(u8),
     #[error("lobby roster contains duplicate slot index {0}")]
     DuplicateRosterSlotIndex(u8),
+    #[error("invalid lobby countdown value: {0} seconds")]
+    InvalidCountdownSeconds(u8),
+}
+
+pub fn validate_lobby_countdown_seconds(
+    remaining_seconds: u8,
+) -> Result<(), LobbySessionValidationError> {
+    if remaining_seconds == 0
+        || remaining_seconds > LOBBY_COUNTDOWN_SECONDS
+        || !remaining_seconds.is_multiple_of(LOBBY_COUNTDOWN_STEP_SECONDS)
+    {
+        return Err(LobbySessionValidationError::InvalidCountdownSeconds(
+            remaining_seconds,
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_lobby_session_protocol_version(
@@ -509,10 +565,28 @@ mod tests {
             AgentLobbyMessage::join("Player#1234".to_owned()).expect("player name should be valid");
 
         assert_eq!(message.validate(), Ok(()));
-        assert_eq!(message.player_name(), "Player#1234");
+        assert_eq!(message.join_player_name(), Some("Player#1234"));
         assert_eq!(
             serde_json::to_string(&message).expect("join should serialize"),
-            r#"{"type":"join","protocol_version":1,"player_name":"Player#1234"}"#
+            r#"{"type":"join","protocol_version":2,"player_name":"Player#1234"}"#
+        );
+    }
+
+    #[test]
+    fn validates_ready_and_countdown_control_messages() {
+        let ready = AgentLobbyMessage::ready();
+
+        assert_eq!(ready.validate(), Ok(()));
+        assert_eq!(ready.join_player_name(), None);
+        assert_eq!(validate_lobby_countdown_seconds(60), Ok(()));
+        assert_eq!(validate_lobby_countdown_seconds(10), Ok(()));
+        assert_eq!(
+            validate_lobby_countdown_seconds(55),
+            Err(LobbySessionValidationError::InvalidCountdownSeconds(55))
+        );
+        assert_eq!(
+            serde_json::to_string(&ready).expect("ready should serialize"),
+            r#"{"type":"ready","protocol_version":2}"#
         );
     }
 
@@ -543,6 +617,11 @@ mod tests {
                 players: PlayerCount {
                     current: 1,
                     max: MAX_WARCRAFT_PLAYERS,
+                },
+                virtual_host: LobbyPlayer {
+                    player_id: MAX_WARCRAFT_PLAYERS,
+                    slot_index: MAX_WARCRAFT_PLAYERS - 1,
+                    name: "Strajer".to_owned(),
                 },
             }],
         }

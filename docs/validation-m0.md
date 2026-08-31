@@ -1,6 +1,6 @@
 # Validare milestone M0
 
-Data: 30 august 2026.
+Actualizat: 31 august 2026.
 
 ## Mediu
 
@@ -12,8 +12,8 @@ Data: 30 august 2026.
 ## Verificări reușite
 
 - `cargo fmt --all --check`;
-- `cargo test --workspace --locked`: 27 teste trecute, inclusiv 14 pentru framing
-  și `REQJOIN`;
+- `cargo test --workspace --all-targets`: 76 teste trecute pentru protocol,
+  framing W3GS, LAN, server, agent, countdown si map transfer;
 - `cargo clippy --workspace --all-targets -- -D warnings`;
 - build Linux al imaginii `strajer-strajer-server` din `Cargo.lock`;
 - container `healthy`, UID/GID `10001:10001`, root filesystem read-only, toate capabilities eliminate și `no-new-privileges` activ;
@@ -29,15 +29,28 @@ Data: 30 august 2026.
 - `Strajer.app` pornește agentul ca proces copil și publică același lobby fără agent CLI separat;
 - aplicația poate afișa evenimentul non-sensibil `Join request detected` după un
   `REQJOIN` valid;
+- override-ul WebUI pentru Reforged `2.0.4` înlocuiește exact cele patru trimiteri
+  greșite `selectedGame` cu `selectedGameId` si cele sapte valori initiale de
+  nickname; testul Swift trece pe fixture-ul real `GlueManager.js`; după restart, Join-ul offline a
+  produs `REQJOIN`, `lobby_joined` și un roster coordonat de doi jucători;
+- heartbeat-ul WSS la 30 s mentine lobby-ul public activ peste 128 s, depasind
+  timeout-ul idle vechi de aproximativ 90 s fara reconnect sau eroare;
+- doua Mac-uri au intrat simultan in acelasi lobby coordonat;
+- agentul de pe Mac-ul fara asset a descarcat si verificat harta in cache;
+- serverul rezerva 10 sloturi umane, iar agentul ocupa slotul final `HOSTBOT` cu
+  playerul virtual `Strajer`;
+- serverul testeaza countdown-ul 60/50/40/30/20/10, anularea la leave si startul
+  numai dupa ready pentru toti jucatorii;
+- listener-ele Warcraft sunt verificate pe acelasi port, exclusiv pe loopback
+  IPv4 si IPv6;
 - executabilele SwiftUI și Rust din bundle conțin ambele arhitecturi: `arm64` și `x86_64`;
 - semnătura ad-hoc, ZIP-ul extras și checksum-ul SHA-256 au fost validate.
 
 ## Încă nevalidate
 
-- vizibilitatea simultană pe ambele Mac-uri aflate din nou în același LAN, cu
-  pachetul care include fixul `LocalOnly`;
-- afișarea descriptorului DotA curent și detectarea `REQJOIN` într-o sesiune
-  Warcraft reală după deploy;
-- pachetul `REQJOIN` real și forwarding-ul către Linux;
-- map availability, lobby W3GS și pornirea jocului;
-- confirmarea pe al doilea Mac, Developer ID signing și notarizarea Apple.
+- deploy-ul coordonat schema catalog `3` / session protocol `2`;
+- afisarea live `Strajer` in `HOSTBOT` si countdown-ul chat pe ambele Mac-uri;
+- tranzitia live simultana a celor 10 clienti spre loading;
+- load sync uman, action data-plane, leave/lag handling si replay;
+- 50 de cicluri complete fara task-uri sau sloturi fantoma;
+- Developer ID signing, hardened runtime și notarizarea Apple.

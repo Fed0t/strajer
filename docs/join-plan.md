@@ -26,6 +26,14 @@ aparține milestone-ului de gameplay.
   de Strajer prin DNS-SD.
 - Fiecare agent publică acum serviciul Bonjour ca `LocalOnly`; două Mac-uri din
   același LAN nu mai concurează pentru același service instance.
+- Listener-ul local folosește același port pe IPv4 și IPv6; testul automat
+  confirmă conexiuni prin `127.0.0.1` și `::1`.
+- Reforged `2.0.4` are o regresie WebUI în modul offline: trimite
+  `selectedGame` în loc de `selectedGameId`. Override-ul local verificat repară
+  exact cele patru apeluri afectate fără să modifice arhiva CASC. `Strajer.app`
+  il deriva acum automat din WebUI-ul servit local de joc, valideaza semnatura si
+  cere un singur restart Warcraft dupa instalare; fisierul Blizzard nu este
+  inclus in distributia Strajer.
 - Warcraft inițiază o conexiune TCP către portul din recordul LAN atunci când
   utilizatorul apasă `Join`.
 - Agentul citește incremental primul frame W3GS și validează `REQJOIN`,
@@ -37,12 +45,21 @@ aparține milestone-ului de gameplay.
 - Serverul distribuie harta printr-un endpoint HTTPS autentificat, iar agentul o
   validează, o păstrează într-un cache atomic și implementează transferul W3GS în
   ferestre cu backpressure bazat pe `MAPSIZE`.
-- UI-ul Warcraft a fost validat local la `2/11` cu o a doua sesiune WSS
-  sintetică, apoi a revenit la `1/11` după disconnect fără slot fantomă.
+- UI-ul Warcraft a fost validat pe doua Mac-uri cu doua sesiuni WSS reale si
+  roster comun. Valorile istorice `2/11` si `1/11` erau anterioare host-ului
+  virtual; build-ul nou trebuie sa afiseze `Strajer` suplimentar in `HOSTBOT`.
+- Join-ul Reforged offline a fost validat după workaround: agentul a primit
+  `REQJOIN`, serverul a alocat player ID `2`, iar roster-ul a ajuns la doi
+  jucători.
+- Proxy-ul public inchidea WSS dupa aproximativ 90 de secunde fara trafic.
+  Agentul trimite acum heartbeat WebSocket la 30 de secunde; acelasi lobby a
+  ramas activ peste 128 de secunde in testul public, fara reconnect sau eroare
+  WSS.
 
-Validarea pe două Mac-uri reale necesită deploy-ul acestei versiuni a
-containerului public și același build macOS pe ambele calculatoare. Pornirea
-jocului și data-plane-ul action-urilor nu sunt încă implementate.
+Join-ul simultan pe doua Mac-uri este validat. Urmatorul deploy trebuie sa
+actualizeze coordonat serverul la catalog schema `3` / session protocol `2` si
+ambele aplicatii; versiunile vechi sunt refuzate intentionat. Tranzitia spre
+loading este implementata, dar data-plane-ul action-urilor nu este inca.
 
 Manifestul verificat local la 30 august 2026 este:
 
@@ -82,14 +99,15 @@ outbound de agent.
 - Un service instance DNS-SD `LocalOnly` pentru fiecare listener.
 - `NO_AUTO_RENAME` rămâne activ pentru a detecta două instanțe Strajer pornite
   accidental pe același Mac.
-- Publicarea `LocalOnly` este verificată; listener-ul TCP rămâne pe un port
-  dinamic și nu trebuie expus în firewall. Restrângerea bind-ului la loopback
-  necesită o validare separată cu rezolvarea făcută de build-ul Warcraft curent.
+- Publicarea `LocalOnly` este verificată; listener-ele TCP folosesc acelasi port
+  dinamic, dar sunt legate exclusiv pe `127.0.0.1` si `::1`.
 
 ### Control-plane
 
 - HTTPS pe `443/tcp`, terminat de Nginx Proxy Manager.
 - Catalog HTTP și un WebSocket persistent per sesiune de lobby.
+- Heartbeat WebSocket trimis de agent la 30 de secunde pentru a mentine
+  sesiunea activa prin timeout-urile idle ale reverse proxy-ului.
 - Bearer token comun, configurat prin `STRAJER_JOIN_TOKEN`, pentru private beta.
 - Bootstrap-ul de identitate și token-ul de sesiune scurt și revocabil rămân
   hardening-ul de producție.
@@ -106,7 +124,7 @@ outbound de agent.
 
 ### Distribuția hărții
 
-- catalog schema `2` publică dimensiunea arhivei, CRC32-ul brut, SHA-1-ul și
+- catalog schema `3` publică host-ul virtual, dimensiunea arhivei, CRC32-ul brut, SHA-1-ul și
   checksum-ul Xoro necesare pentru `MAPCHECK`;
 - containerul montează hărțile read-only și validează asset-ul complet la boot;
 - `GET /v1/maps/{sha1}` folosește același bearer token private-beta și răspunde
@@ -139,6 +157,10 @@ HTTP Upgrade        Authorization: Bearer <STRAJER_JOIN_TOKEN>
 Join                { protocol_version, player_name }
 Joined              { protocol_version, player_id, roster }
 Roster              { roster }
+Ready               { protocol_version }
+Countdown           { remaining_seconds }
+CountdownCancelled  {}
+Start               {}
 Rejected            { code }
 ```
 
@@ -323,6 +345,33 @@ deschise.
 - checksum/desync diagnostics;
 - replay `.w3g`.
 
+#### Autoritatea pentru `Start Game`
+
+Verificarea live din Reforged `2.0.4.23745` arata o diferenta importanta intre
+numele afisat ca host si rolul nativ de host. Primul player este afisat in lobby
+ca `HOST`, dar clientul nu primeste butonul `Start Game`. WebUI apeleaza
+`LobbyStart` numai cand evenimentul nativ `GameLobbySetup` seteaza `isHost=true`.
+In Strajer, fiecare Warcraft este client W3GS al agentului local, deci niciun
+Warcraft nu este host-ul nativ.
+
+Decizia implementata pentru J3 este:
+
+- serverul Linux ramane autoritatea unica pentru tranzitia lobby -> countdown ->
+  loading -> gameplay;
+- harta are 11 sloturi totale: 10 umane si slotul final `HOSTBOT`, ocupat de
+  playerul virtual `Strajer` cu PID 11;
+- fiecare agent trimite `ready` numai dupa ce Warcraft confirma harta completa;
+- cand toate cele 10 sloturi umane sunt ocupate si ready, serverul porneste
+  automat timerul de 60 secunde;
+- serverul publica evenimentele 60/50/40/30/20/10, iar fiecare agent le afiseaza
+  in chat ca mesaje W3GS trimise de `Strajer`;
+- orice leave inainte de start anuleaza timerul; un lobby plin si ready il poate
+  porni din nou;
+- la zero, agentii trimit local `W3GS_COUNTDOWN_START`, `W3GS_COUNTDOWN_END` si
+  marcheaza host-ul virtual ca loaded;
+- nu fortam `isHost` printr-un patch WebUI: `LobbyStart` ar apela host engine-ul
+  local inexistent si ar rupe modelul autoritativ.
+
 Ieșire: doi jucători pornesc aceeași hartă, joacă minimum 15 minute și replay-ul
 rezultat poate fi deschis, repetat în 20 de cicluri înainte de hardening.
 
@@ -345,7 +394,8 @@ wire protocol-ul Reforged curent și implementările W3GS clasice disponibile pu
 5. endpoint de hartă, cache verificat și transfer W3GS — implementate, validarea
    live pe client fără hartă este următorul gate;
 6. deploy public și validare simultană pe două Mac-uri — după gate-ul de hartă;
-7. countdown, load sync și data-plane de gameplay — etapa următoare.
+7. host virtual, ready si countdown autoritativ — implementate;
+8. load sync uman si data-plane de gameplay — etapa următoare.
 
 ## Surse de interoperabilitate
 

@@ -109,6 +109,9 @@ for architecture in ${BUILD_ARCHITECTURES}; do
         -sdk "${MACOS_SDK}" \
         -framework AppKit \
         -framework SwiftUI \
+        "${SOURCE_DIRECTORY}/Sources/NicknameController.swift" \
+        "${SOURCE_DIRECTORY}/Sources/WarcraftCompatibilitySupport.swift" \
+        "${SOURCE_DIRECTORY}/Sources/WarcraftCompatibilityController.swift" \
         "${SOURCE_DIRECTORY}/Sources/AgentController.swift" \
         "${SOURCE_DIRECTORY}/Sources/StrajerApp.swift" \
         -o "${swift_binary}"
