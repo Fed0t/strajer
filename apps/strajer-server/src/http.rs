@@ -297,9 +297,6 @@ async fn run_connected_lobby_socket(
                     }
                     Ok(LobbyUpdate::Start) => Some(ServerLobbyMessage::Start),
                     Ok(LobbyUpdate::PlayerLoaded { player_id }) => {
-                        if player_id == membership.player_id {
-                            continue;
-                        }
                         Some(ServerLobbyMessage::PlayerLoaded { player_id })
                     }
                     Ok(LobbyUpdate::PlayerLeft {
@@ -325,7 +322,7 @@ async fn run_connected_lobby_socket(
                             skipped_updates,
                             "lobby client lagged behind control updates; sending authoritative snapshot"
                         );
-                        send_lobby_control_snapshot(socket, room, membership.player_id).await?;
+                        send_lobby_control_snapshot(socket, room).await?;
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -338,11 +335,7 @@ async fn run_connected_lobby_socket(
     }
 }
 
-async fn send_lobby_control_snapshot(
-    socket: &mut WebSocket,
-    room: &LobbyRoom,
-    recipient_player_id: u8,
-) -> Result<()> {
+async fn send_lobby_control_snapshot(socket: &mut WebSocket, room: &LobbyRoom) -> Result<()> {
     let snapshot = room.control_snapshot().await;
     send_server_message(
         socket,
@@ -360,10 +353,8 @@ async fn send_lobby_control_snapshot(
         LobbyPhase::Loading => {
             send_server_message(socket, &ServerLobbyMessage::Start).await?;
             for player_id in snapshot.loaded_player_ids {
-                if player_id != recipient_player_id {
-                    send_server_message(socket, &ServerLobbyMessage::PlayerLoaded { player_id })
-                        .await?;
-                }
+                send_server_message(socket, &ServerLobbyMessage::PlayerLoaded { player_id })
+                    .await?;
             }
             Ok(())
         }
@@ -787,6 +778,33 @@ mod tests {
         server_task.abort();
     }
 
+    #[tokio::test]
+    async fn publishes_loaded_confirmation_back_to_the_originating_player() {
+        let state = AppState::synthetic_at(2_000, 2).expect("state should be valid");
+        let room = state
+            .lobby_room("synthetic-1")
+            .expect("synthetic lobby should exist");
+        let (endpoint, server_task) = start_websocket_server_with_state(state).await;
+        let mut first = connect_lobby_client(&endpoint, "First#1000").await;
+        let first_player_id = receive_joined(&mut first).await.0;
+        let mut second = connect_lobby_client(&endpoint, "Second#2000").await;
+        let second_player_id = receive_joined(&mut second).await.0;
+        receive_roster_with_count(&mut first, 2).await;
+
+        room.start_for_test().await;
+        receive_start(&mut first).await;
+        receive_start(&mut second).await;
+
+        send_agent_control(&mut first, AgentLobbyMessage::loaded()).await;
+        assert_eq!(receive_player_loaded(&mut first).await, first_player_id);
+        assert_eq!(receive_player_loaded(&mut second).await, first_player_id);
+
+        send_agent_control(&mut second, AgentLobbyMessage::loaded()).await;
+        assert_eq!(receive_player_loaded(&mut first).await, second_player_id);
+        assert_eq!(receive_player_loaded(&mut second).await, second_player_id);
+        server_task.abort();
+    }
+
     type TestLobbySocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
     async fn start_websocket_server() -> (String, JoinHandle<()>) {
@@ -916,6 +934,32 @@ mod tests {
         })
         .await
         .expect("countdown should arrive")
+    }
+
+    async fn receive_start(socket: &mut TestLobbySocket) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if receive_control_message(socket).await == ServerLobbyMessage::Start {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("start should arrive");
+    }
+
+    async fn receive_player_loaded(socket: &mut TestLobbySocket) -> u8 {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerLobbyMessage::PlayerLoaded { player_id } =
+                    receive_control_message(socket).await
+                {
+                    return player_id;
+                }
+            }
+        })
+        .await
+        .expect("player-loaded confirmation should arrive")
     }
 
     async fn receive_control_message(socket: &mut TestLobbySocket) -> ServerLobbyMessage {

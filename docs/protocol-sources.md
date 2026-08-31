@@ -60,6 +60,9 @@ verificate incrucisat astfel:
 - [GHost++ `game_base.cpp`](https://github.com/dcramer/ghostplusplus/blob/master/ghost/game_base.cpp)
   confirma tick-ul clasic de 100 ms, limita de 1.452 bytes pentru subpacket si
   compararea checksum-urilor numai dupa ce fiecare player activ are o valoare.
+  `EventPlayerLoaded` publica `GAMELOADED_OTHERS` tuturor sesiunilor, inclusiv
+  sesiunii care a trimis `GAMELOADED_SELF`; Warcraft asteapta confirmarea
+  coordonata pentru fiecare PID inainte de primul timeslot.
 
 Implementările publice clasice nu sunt tratate drept dovadă că Reforged păstrează
 identic fiecare câmp. Fixture-urile build-ului local au prioritate când există o

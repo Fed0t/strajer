@@ -302,10 +302,7 @@ impl RemoteLobbySession {
             }
             ServerLobbyMessage::Start => Ok(Some(RemoteLobbyEvent::Start)),
             ServerLobbyMessage::PlayerLoaded { player_id } => {
-                if player_id == 0
-                    || player_id > self.maximum_players
-                    || player_id == self.assigned_player_id
-                {
+                if player_id == 0 || player_id > self.maximum_players {
                     bail!("coordinated lobby returned an invalid loaded player");
                 }
                 Ok(Some(RemoteLobbyEvent::PlayerLoaded { player_id }))
@@ -482,6 +479,7 @@ mod tests {
     use strajer_server::{AppState, router};
     use strajer_w3gs::{IncomingActionFrame, incoming_action_frames};
     use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
 
     use super::*;
 
@@ -621,6 +619,69 @@ mod tests {
         let after_leave = receive_roster_with_count(&mut first, 1).await;
         assert_eq!(after_leave.players[0].player_id, 1);
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn accepts_loaded_confirmation_for_the_local_player() {
+        let state = AppState::synthetic_at(2_000, 2).expect("state should be valid");
+        let lobby = state.catalog().lobbies[0].clone();
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener address should be available");
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("client should connect");
+            let mut socket = accept_async(stream)
+                .await
+                .expect("WebSocket handshake should complete");
+            socket
+                .next()
+                .await
+                .expect("join message should arrive")
+                .expect("join message should be valid");
+            let roster = LobbyRoster {
+                revision: 1,
+                players: vec![strajer_protocol::LobbyPlayer {
+                    player_id: 1,
+                    slot_index: 0,
+                    name: "Local#1000".to_owned(),
+                }],
+            };
+            for message in [
+                ServerLobbyMessage::Joined {
+                    protocol_version: LOBBY_SESSION_PROTOCOL_VERSION,
+                    player_id: 1,
+                    roster,
+                },
+                ServerLobbyMessage::PlayerLoaded { player_id: 1 },
+            ] {
+                let text = serde_json::to_string(&message)
+                    .expect("server control message should serialize");
+                socket
+                    .send(Message::Text(text.into()))
+                    .await
+                    .expect("server control message should send");
+            }
+        });
+
+        let mut session = RemoteLobbySession::connect(
+            &format!("http://{address}"),
+            &lobby,
+            "Local#1000".to_owned(),
+            None,
+        )
+        .await
+        .expect("agent session should connect");
+        assert_eq!(
+            session
+                .next_event()
+                .await
+                .expect("loaded event should validate"),
+            Some(RemoteLobbyEvent::PlayerLoaded { player_id: 1 })
+        );
+        server_task.await.expect("test server should finish");
     }
 
     async fn receive_roster_with_count(

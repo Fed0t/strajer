@@ -34,7 +34,7 @@ nu a trecut gate-ul live de 15 minute pe doua Mac-uri si nu genereaza replay.
 - container Linux non-root, read-only, fara capabilitati si cu healthcheck;
 - build macOS universal `arm64` + `x86_64`, verificat prin `codesign` ad-hoc.
 
-Validarea curenta are 94 de teste Rust, testul Swift pe fixture-ul WebUI real,
+Validarea curenta are 96 de teste Rust, testul Swift pe fixture-ul WebUI real,
 `cargo clippy -D warnings`, verificarea Docker Compose, build-ul imaginii Docker
 si verificarea bundle-ului/ZIP-ului macOS.
 

@@ -626,7 +626,7 @@ async fn run_lobby_session(
     );
     let mut map_transfer = MapTransferState::AwaitingStatus;
     let mut game_started = false;
-    let mut loaded_remote_player_ids = HashSet::new();
+    let mut loaded_player_ids = HashSet::new();
 
     loop {
         tokio::select! {
@@ -767,11 +767,11 @@ async fn run_lobby_session(
                         if roster.player(player_id).is_none() {
                             bail!("coordinated lobby loaded player is not in the current roster");
                         }
-                        if !loaded_remote_player_ids.insert(player_id) {
+                        if !loaded_player_ids.insert(player_id) {
                             debug!(
                                 lobby_id = %config.lobby.id,
                                 player_id,
-                                "ignored idempotent remote loaded state"
+                                "ignored idempotent coordinated loaded state"
                             );
                             continue;
                         }
@@ -779,7 +779,7 @@ async fn run_lobby_session(
                         info!(
                             lobby_id = %config.lobby.id,
                             player_id,
-                            "reported remote player as loaded to Warcraft"
+                            "reported coordinated player as loaded to Warcraft"
                         );
                     }
                     RemoteLobbyEvent::PlayerLeft {
@@ -804,7 +804,7 @@ async fn run_lobby_session(
                             )?,
                         )
                         .await?;
-                        loaded_remote_player_ids.remove(&player_id);
+                        loaded_player_ids.remove(&player_id);
                         roster = next_roster;
                         info!(
                             lobby_id = %config.lobby.id,

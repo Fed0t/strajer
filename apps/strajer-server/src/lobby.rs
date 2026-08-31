@@ -416,6 +416,15 @@ impl LobbyRoom {
         self.state.lock().await.roster()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn start_for_test(&self) {
+        let mut state = self.state.lock().await;
+        state.countdown_active = false;
+        state.countdown_remaining_seconds = None;
+        state.started = true;
+        let _ = self.updates.send(LobbyUpdate::Start);
+    }
+
     pub(crate) async fn control_snapshot(&self) -> LobbyControlSnapshot {
         let state = self.state.lock().await;
         let phase = if state.game_ended {
