@@ -7,14 +7,18 @@ același lobby găzduit de `strajer-server` pe Linux. Fiecare client vede jocul 
 în `Local Area Network`; Strajer nu publică nimic în catalogul Multiplayer
 Battle.net și nu cere port forwarding pe Mac-uri.
 
-Există două praguri distincte:
+Există trei praguri distincte:
 
-1. **Remote join transport**: primul `W3GS_REQJOIN` primit local de agent ajunge
-   nealterat la serverul Linux.
-2. **Real lobby join**: host engine-ul răspunde cu `W3GS_SLOTINFOJOIN`, iar
-   Warcraft deschide lobby-ul și afișează jucătorii și sloturile.
+1. **Join coordonat**: agentul validează local `W3GS_REQJOIN`, iar serverul Linux
+   alocă player ID-ul și slotul prin WSS.
+2. **Real lobby join**: agentul proiectează roster-ul serverului în
+   `W3GS_SLOTINFOJOIN`, `PLAYERINFO` și `MAPCHECK`, iar Warcraft deschide lobby-ul
+   și afișează jucătorii și sloturile.
+3. **Gameplay remote**: action-urile W3GS sunt transportate și ordonate de
+   serverul autoritativ până la finalul jocului.
 
-Milestone-ul M1 acoperă primul prag. M2 acoperă al doilea.
+Primele două praguri sunt implementate în vertical slice-ul curent. Al treilea
+aparține milestone-ului de gameplay.
 
 ## Ce este deja verificat
 
@@ -24,12 +28,18 @@ Milestone-ul M1 acoperă primul prag. M2 acoperă al doilea.
   același LAN nu mai concurează pentru același service instance.
 - Warcraft inițiază o conexiune TCP către portul din recordul LAN atunci când
   utilizatorul apasă `Join`.
-- Agentul citește incremental primul frame W3GS și validează prefixul tipizat
-  `REQJOIN`; forwarding-ul nu este încă implementat.
-- Serverul actual expune numai catalogul HTTP și endpoint-urile de health.
+- Agentul citește incremental primul frame W3GS și validează `REQJOIN`,
+  `host_counter` și `entry_key`.
+- Serverul expune un endpoint WSS per lobby, autentificat cu bearer token,
+  alocă player ID-uri și sloturi și distribuie un roster versionat.
+- Agentul trimite local `SLOTINFOJOIN`, slot info, `PLAYERINFO`, profile/skins
+  Reforged și `MAPCHECK`, apoi aplică join/leave live.
+- UI-ul Warcraft a fost validat local la `2/11` cu o a doua sesiune WSS
+  sintetică, apoi a revenit la `1/11` după disconnect fără slot fantomă.
 
-Catalogul publică acum harta reală `DotA_v6_89Q.w3x`; un join complet mai
-necesită răspunsurile W3GS valide ale host engine-ului.
+Validarea pe două Mac-uri reale necesită deploy-ul acestei versiuni a
+containerului public și același build macOS pe ambele calculatoare. Pornirea
+jocului și data-plane-ul action-urilor nu sunt încă implementate.
 
 Manifestul verificat local la 30 august 2026 este:
 
@@ -56,9 +66,12 @@ Warcraft B ─TCP local─> strajer-agent B ─outbound TLS/QUIC─┘
                                       └─ LobbyActor + W3GS host engine
 ```
 
-Agentul este un proxy W3GS local, nu un host autoritativ. Serverul Linux deține
-starea lobby-ului, alocă player ID-urile și sloturile și generează pachetele
-server-to-client. Toate conexiunile de Internet sunt inițiate outbound de agent.
+Agentul este un proxy W3GS local, nu host-ul final de gameplay. În slice-ul
+curent, serverul Linux deține starea lobby-ului și alocă player ID-urile și
+sloturile, iar fiecare agent generează local pachetele server-to-client care
+proiectează aceeași stare. Host engine-ul autoritativ pentru action loop rămâne
+pe server în arhitectura țintă. Toate conexiunile de Internet sunt inițiate
+outbound de agent.
 
 ### Discovery local
 
@@ -66,20 +79,24 @@ server-to-client. Toate conexiunile de Internet sunt inițiate outbound de agent
 - Un service instance DNS-SD `LocalOnly` pentru fiecare listener.
 - `NO_AUTO_RENAME` rămâne activ pentru a detecta două instanțe Strajer pornite
   accidental pe același Mac.
-- Înainte de M1 trebuie verificat dacă target-ul rezolvat de Warcraft permite
-  listener pe loopback. Până atunci bind-ul rămâne compatibil cu captura actuală;
-  listener-ul nu trebuie expus în firewall.
+- Publicarea `LocalOnly` este verificată; listener-ul TCP rămâne pe un port
+  dinamic și nu trebuie expus în firewall. Restrângerea bind-ului la loopback
+  necesită o validare separată cu rezolvarea făcută de build-ul Warcraft curent.
 
 ### Control-plane
 
 - HTTPS pe `443/tcp`, terminat de Nginx Proxy Manager.
-- Bootstrap de identitate, catalog, token de sesiune scurt și revocabil.
-- Un WebSocket persistent pentru control și fallback de transport.
+- Catalog HTTP și un WebSocket persistent per sesiune de lobby.
+- Bearer token comun, configurat prin `STRAJER_JOIN_TOKEN`, pentru private beta.
+- Bootstrap-ul de identitate și token-ul de sesiune scurt și revocabil rămân
+  hardening-ul de producție.
 
 ### Data-plane
 
-- Pentru M1: WSS pe `443/tcp`, deoarece funcționează prin proxy-ul existent și
-  reduce variabilele în primul test end-to-end.
+- Pentru slice-ul curent: WSS pe `443/tcp` transportă join-ul și roster-ul,
+  deoarece funcționează prin proxy-ul existent și reduce variabilele.
+- Pentru gameplay: este necesar un data-plane binar pentru action-uri, keepalive,
+  load sync și leave; schema nu este încă fixată.
 - Pentru producție: QUIC pe `443/udp`, direct către container, cu câte un stream
   bidirecțional per conexiune Warcraft și WSS fallback.
 - Portul Warcraft `6112` nu este publicat și nu este forwardat în router.
@@ -89,28 +106,21 @@ nu este alegerea finală pentru gameplay: pierderea unui segment exterior ar
 bloca toate fluxurile multiplexate peste aceeași conexiune TCP. QUIC izolează
 fluxurile și păstrează transportul outbound-only.
 
-## Contractul agent–server
+## Contractul agent–server curent
 
 Control messages sunt versionate și au o limită strictă de dimensiune:
 
 ```text
-Hello              { protocol_version, installation_id, agent_version, wc3_build }
-Authenticate       { bootstrap_or_session_token, nonce }
-OpenJoin           { lobby_id, stream_id, join_nonce, reqjoin_length }
-OpenAccepted       { stream_id, session_id }
-OpenRejected       { stream_id, reason_code }
-Data               { stream_id, sequence, payload }
-HalfClose          { stream_id, direction }
-Close              { stream_id, reason_code }
-Ping / Pong         { monotonic_timestamp }
+HTTP Upgrade        Authorization: Bearer <STRAJER_JOIN_TOKEN>
+Join                { protocol_version, player_name }
+Joined              { protocol_version, player_id, roster }
+Roster              { roster }
+Rejected            { code }
 ```
 
-Payload-ul `Data` este binar. JSON rămâne numai pentru endpoint-uri de control
-și diagnostic; nu se folosește pentru pachetele W3GS.
-
-În implementarea WSS, `stream_id` și `sequence` asigură multiplexarea și
-validarea ordinii. În QUIC, fiecare join primește propriul bidirectional stream,
-iar envelope-ul păstrează `session_id`, versiunea și tipul mesajului.
+Mesajele sunt JSON bounded la 4 KiB. W3GS rămâne între Warcraft și agent în
+acest slice; pachetele nu sunt serializate în JSON. Data-plane-ul de gameplay va
+folosi payload binar și sequence numbers sau stream-uri QUIC.
 
 Serverul acceptă numai un `lobby_id` emis de catalogul său. Protocolul nu oferă
 agentului un câmp arbitrar `host:port`, evitând transformarea Strajer într-un
@@ -190,6 +200,11 @@ diagnosticat.
 
 ## Identitate și securitate
 
+- Implementat pentru private beta: token comun aleator de 32–128 caractere,
+  obligatoriu pe bind non-loopback, trimis ca bearer peste WSS și comparat
+  constant-time pe server.
+- Token-ul este inclus în `Info.plist` la build și poate fi extras; limitează
+  accesul accidental, dar nu reprezintă identitate puternică.
 - secret aleator per instalare, păstrat în macOS Keychain;
 - bootstrap prin HTTPS și token de sesiune cu expirare scurtă;
 - `OpenJoin` legat de installation ID, lobby ID, nonce și expiry;
@@ -253,6 +268,11 @@ over-read sau diferențe între payload-ul capturat și fixture.
 Ieșire: `REQJOIN` de pe ambele Mac-uri ajunge byte-identic pe Linux, fără port
 forwarding pe clienți și fără posibilitatea de a selecta o destinație arbitrară.
 
+Status la 31 august 2026: WSS autentificat, limitele de mesaj, timeout-urile și
+rutarea strictă prin `lobby_id` sunt implementate pentru control/roster. Tunelul
+binar byte-identic a fost amânat până la data-plane-ul de gameplay, deoarece
+join-ul lobby poate fi coordonat fără a expedia frame-ul brut.
+
 ### J2 — Lobby single-player și apoi two-player, 1–2 săptămâni
 
 - actor de lobby și session actor;
@@ -262,6 +282,12 @@ forwarding pe clienți și fără posibilitatea de a selecta o destinație arbit
 
 Ieșire: primul Mac intră în UI-ul lobby-ului; apoi două Mac-uri se văd reciproc,
 iar 50 de cicluri join/leave nu lasă sloturi sau task-uri fantomă.
+
+Status la 31 august 2026: single-player join și roster-ul two-player au fost
+validate în UI pe un Mac, folosind o a doua sesiune WSS reală către serverul
+local. Testele automate validează două sesiuni, player IDs distincte și cleanup
+protejat împotriva disconnect-urilor stale. Testul pe două Mac-uri și cele 50 de
+cicluri rămân criterii deschise.
 
 ### J3 — Start și gameplay, 2–4 săptămâni
 
@@ -283,15 +309,14 @@ rezultat poate fi deschis, repetat în 20 de cicluri înainte de hardening.
 Estimările se recalculează după J0; cea mai mare necunoscută este diferența dintre
 wire protocol-ul Reforged curent și implementările W3GS clasice disponibile public.
 
-## Prima iterație de cod după fixul mDNS
+## Stadiul iterației după fixul mDNS
 
-Ordinea recomandată, fără schimbări speculative în host engine:
-
-1. `strajer-w3gs` cu `FrameHeader`, `FrameReader` și `ReqJoin` — implementat;
-2. înlocuirea read-ului unic de 4 KiB cu citire framed și timeout — implementată;
-3. capturarea și redactarea primului fixture real din `2.0.4.23745` — următorul gate;
-4. fixează schema `REQJOIN` pe baza fixture-ului;
-5. abia apoi definește envelope-ul WSS și endpoint-ul server-side.
+1. `FrameReader`, `ReqJoin`, validările și timeout-urile — implementate;
+2. endpoint WSS bounded și autentificat — implementat;
+3. registry server-side, player IDs, sloturi și cleanup — implementate;
+4. `SLOTINFOJOIN`, `PLAYERINFO`, profile/skins, `MAPCHECK` și roster live — implementate;
+5. deploy public și validare simultană pe două Mac-uri — următorul gate;
+6. countdown, load sync și data-plane de gameplay — etapa următoare.
 
 ## Surse de interoperabilitate
 

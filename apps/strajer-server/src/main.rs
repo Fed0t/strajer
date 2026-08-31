@@ -27,7 +27,9 @@ async fn main() -> Result<()> {
 
 async fn run_server() -> Result<()> {
     let config = ServerConfig::from_environment()?;
-    let state = AppState::synthetic().context("could not initialize lobby catalog")?;
+    let state = AppState::synthetic()
+        .context("could not initialize lobby catalog")?
+        .with_join_token(config.join_token().map(str::to_owned));
     let listener = TcpListener::bind(config.bind_address)
         .await
         .with_context(|| format!("could not bind {}", config.bind_address))?;

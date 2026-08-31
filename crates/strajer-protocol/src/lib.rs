@@ -6,8 +6,147 @@ use thiserror::Error;
 pub const CATALOG_SCHEMA_VERSION: u16 = 1;
 pub const DEFAULT_WARCRAFT_PRODUCT: &str = "W3XP";
 pub const DEFAULT_WARCRAFT_VERSION: &str = "2.0.4.23745";
+pub const LOBBY_SESSION_PROTOCOL_VERSION: u16 = 1;
+pub const MAX_LOBBY_CONTROL_MESSAGE_BYTES: usize = 4_096;
+pub const MAX_LOBBY_PLAYER_NAME_BYTES: usize = 15;
 pub const MAX_GAME_NAME_BYTES: usize = 31;
 pub const MAX_WARCRAFT_PLAYERS: u8 = 24;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentLobbyMessage {
+    Join {
+        protocol_version: u16,
+        player_name: String,
+    },
+}
+
+impl AgentLobbyMessage {
+    pub fn join(player_name: String) -> Result<Self, LobbySessionValidationError> {
+        validate_lobby_player_name(&player_name)?;
+        Ok(Self::Join {
+            protocol_version: LOBBY_SESSION_PROTOCOL_VERSION,
+            player_name,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), LobbySessionValidationError> {
+        match self {
+            Self::Join {
+                protocol_version,
+                player_name,
+            } => {
+                validate_lobby_session_protocol_version(*protocol_version)?;
+                validate_lobby_player_name(player_name)
+            }
+        }
+    }
+
+    pub fn player_name(&self) -> &str {
+        match self {
+            Self::Join { player_name, .. } => player_name,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerLobbyMessage {
+    Joined {
+        protocol_version: u16,
+        player_id: u8,
+        roster: LobbyRoster,
+    },
+    Roster {
+        roster: LobbyRoster,
+    },
+    Rejected {
+        code: LobbyJoinRejection,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LobbyJoinRejection {
+    InvalidRequest,
+    UnsupportedProtocol,
+    InvalidPlayerName,
+    LobbyFull,
+    DuplicatePlayerName,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LobbyRoster {
+    pub revision: u64,
+    pub players: Vec<LobbyPlayer>,
+}
+
+impl LobbyRoster {
+    pub fn validate(&self, maximum_players: u8) -> Result<(), LobbySessionValidationError> {
+        if self.revision == 0 {
+            return Err(LobbySessionValidationError::InvalidRosterRevision);
+        }
+
+        if maximum_players == 0
+            || maximum_players > MAX_WARCRAFT_PLAYERS
+            || self.players.len() > usize::from(maximum_players)
+        {
+            return Err(LobbySessionValidationError::InvalidRosterPlayerCount {
+                actual: self.players.len(),
+                maximum: maximum_players,
+            });
+        }
+
+        let mut player_ids = HashSet::with_capacity(self.players.len());
+        let mut slot_indices = HashSet::with_capacity(self.players.len());
+        for player in &self.players {
+            player.validate(maximum_players)?;
+            if !player_ids.insert(player.player_id) {
+                return Err(LobbySessionValidationError::DuplicateRosterPlayerId(
+                    player.player_id,
+                ));
+            }
+            if !slot_indices.insert(player.slot_index) {
+                return Err(LobbySessionValidationError::DuplicateRosterSlotIndex(
+                    player.slot_index,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn player(&self, player_id: u8) -> Option<&LobbyPlayer> {
+        self.players
+            .iter()
+            .find(|player| player.player_id == player_id)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LobbyPlayer {
+    pub player_id: u8,
+    pub slot_index: u8,
+    pub name: String,
+}
+
+impl LobbyPlayer {
+    fn validate(&self, maximum_players: u8) -> Result<(), LobbySessionValidationError> {
+        if self.player_id == 0 || self.player_id > maximum_players {
+            return Err(LobbySessionValidationError::InvalidRosterPlayerId(
+                self.player_id,
+            ));
+        }
+
+        if self.slot_index >= maximum_players {
+            return Err(LobbySessionValidationError::InvalidRosterSlotIndex(
+                self.slot_index,
+            ));
+        }
+
+        validate_lobby_player_name(&self.name)
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LobbyCatalog {
@@ -170,6 +309,53 @@ pub enum ValidationError {
     InvalidPlayerCount { current: u8, max: u8 },
 }
 
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum LobbySessionValidationError {
+    #[error("unsupported lobby session protocol {actual}; expected {expected}")]
+    UnsupportedProtocolVersion { actual: u16, expected: u16 },
+    #[error(
+        "lobby player name must contain 1 to {MAX_LOBBY_PLAYER_NAME_BYTES} bytes and no NUL byte"
+    )]
+    InvalidPlayerName,
+    #[error("lobby roster revision must not be zero")]
+    InvalidRosterRevision,
+    #[error("lobby roster contains {actual} players; maximum is {maximum}")]
+    InvalidRosterPlayerCount { actual: usize, maximum: u8 },
+    #[error("lobby roster player id {0} is outside the configured range")]
+    InvalidRosterPlayerId(u8),
+    #[error("lobby roster slot index {0} is outside the configured range")]
+    InvalidRosterSlotIndex(u8),
+    #[error("lobby roster contains duplicate player id {0}")]
+    DuplicateRosterPlayerId(u8),
+    #[error("lobby roster contains duplicate slot index {0}")]
+    DuplicateRosterSlotIndex(u8),
+}
+
+fn validate_lobby_session_protocol_version(
+    protocol_version: u16,
+) -> Result<(), LobbySessionValidationError> {
+    if protocol_version != LOBBY_SESSION_PROTOCOL_VERSION {
+        return Err(LobbySessionValidationError::UnsupportedProtocolVersion {
+            actual: protocol_version,
+            expected: LOBBY_SESSION_PROTOCOL_VERSION,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_lobby_player_name(name: &str) -> Result<(), LobbySessionValidationError> {
+    if name.is_empty()
+        || name.len() > MAX_LOBBY_PLAYER_NAME_BYTES
+        || name.contains('\0')
+        || name.chars().any(char::is_control)
+    {
+        return Err(LobbySessionValidationError::InvalidPlayerName);
+    }
+
+    Ok(())
+}
+
 fn validate_lobby_id(id: &str) -> Result<(), ValidationError> {
     if id.is_empty() || id.len() > 64 || !id.bytes().all(is_printable_ascii) {
         return Err(ValidationError::InvalidLobbyId);
@@ -250,6 +436,68 @@ mod tests {
         catalog.lobbies[0].name = "x".repeat(MAX_GAME_NAME_BYTES + 1);
 
         assert_eq!(catalog.validate(), Err(ValidationError::InvalidGameName));
+    }
+
+    #[test]
+    fn validates_a_two_player_lobby_roster() {
+        let roster = LobbyRoster {
+            revision: 3,
+            players: vec![
+                LobbyPlayer {
+                    player_id: 1,
+                    slot_index: 0,
+                    name: "Host#1234".to_owned(),
+                },
+                LobbyPlayer {
+                    player_id: 2,
+                    slot_index: 1,
+                    name: "Friend#5678".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(roster.validate(11), Ok(()));
+        assert_eq!(
+            roster.player(2).map(|player| player.name.as_str()),
+            Some("Friend#5678")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_roster_slots() {
+        let roster = LobbyRoster {
+            revision: 2,
+            players: vec![
+                LobbyPlayer {
+                    player_id: 1,
+                    slot_index: 0,
+                    name: "One".to_owned(),
+                },
+                LobbyPlayer {
+                    player_id: 2,
+                    slot_index: 0,
+                    name: "Two".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            roster.validate(11),
+            Err(LobbySessionValidationError::DuplicateRosterSlotIndex(0))
+        );
+    }
+
+    #[test]
+    fn validates_the_join_control_message() {
+        let message =
+            AgentLobbyMessage::join("Player#1234".to_owned()).expect("player name should be valid");
+
+        assert_eq!(message.validate(), Ok(()));
+        assert_eq!(message.player_name(), "Player#1234");
+        assert_eq!(
+            serde_json::to_string(&message).expect("join should serialize"),
+            r#"{"type":"join","protocol_version":1,"player_name":"Player#1234"}"#
+        );
     }
 
     fn valid_catalog() -> LobbyCatalog {

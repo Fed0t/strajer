@@ -12,6 +12,7 @@ APP_EXECUTABLES="${APP_CONTENTS}/MacOS"
 APP_RESOURCES="${APP_CONTENTS}/Resources"
 BUILD_DIRECTORY="${PROJECT_ROOT}/dist/build-macos"
 SERVER_URL="${STRAJER_SERVER_URL:-http://127.0.0.1:18080}"
+JOIN_TOKEN="${STRAJER_JOIN_TOKEN:-}"
 BUILD_ARCHITECTURES="${STRAJER_ARCHS:-arm64 x86_64}"
 MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
 
@@ -23,6 +24,27 @@ case "${SERVER_URL}" in
         exit 1
         ;;
 esac
+
+is_loopback_server_url() {
+    case "$1" in
+        http://localhost|http://localhost:*|https://localhost|https://localhost:*|http://127.0.0.1|http://127.0.0.1:*|https://127.0.0.1|https://127.0.0.1:*|http://\[::1\]|http://\[::1\]:*|https://\[::1\]|https://\[::1\]:*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+if [[ -z "${JOIN_TOKEN}" ]]; then
+    if ! is_loopback_server_url "${SERVER_URL}"; then
+        echo "STRAJER_JOIN_TOKEN is required for a non-loopback STRAJER_SERVER_URL" >&2
+        exit 1
+    fi
+elif (( ${#JOIN_TOKEN} < 32 || ${#JOIN_TOKEN} > 128 )) || [[ ! "${JOIN_TOKEN}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "STRAJER_JOIN_TOKEN must contain 32 to 128 ASCII letters, digits, underscores or hyphens" >&2
+    exit 1
+fi
 
 rust_target_for_architecture() {
     case "$1" in
@@ -102,6 +124,9 @@ chmod 0755 "${APP_EXECUTABLES}/strajer-agent" "${APP_EXECUTABLES}/Strajer"
 install -m 0644 "${SOURCE_DIRECTORY}/Info.plist" "${APP_CONTENTS}/Info.plist"
 /usr/libexec/PlistBuddy \
     -c "Set :StrajerServerURL ${SERVER_URL}" \
+    "${APP_CONTENTS}/Info.plist"
+/usr/libexec/PlistBuddy \
+    -c "Set :StrajerJoinToken ${JOIN_TOKEN}" \
     "${APP_CONTENTS}/Info.plist"
 plutil -lint "${APP_CONTENTS}/Info.plist"
 

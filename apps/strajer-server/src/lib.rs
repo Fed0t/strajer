@@ -1,5 +1,6 @@
 mod config;
 mod http;
+mod lobby;
 mod state;
 
 pub use config::ServerConfig;

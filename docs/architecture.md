@@ -34,14 +34,17 @@ configurată înainte de orice alocare bazată pe input.
 
 ### `strajer-server`
 
-Control-plane Linux. În primul slice păstrează un lobby sintetic immutable în memorie. Ulterior va deține registry-ul, autentificarea, actorii W3GS și persistența.
+Control-plane Linux cu un catalog sintetic, registry concurent de lobby și un
+endpoint WSS autentificat. Alocă player ID-urile și sloturile, publică roster-ul
+versionat și curăță sesiunile la disconnect. Persistența și identitatea per
+instalare nu sunt încă implementate.
 
 ### `strajer-agent`
 
 Procesul de networking inclus și supravegheat de `Strajer.app`. Descarcă
-lobby-urile, deschide listener-ele locale, publică recordurile LAN și validează
-primul `REQJOIN` încadrat de `strajer-w3gs`. Toate conexiunile către server sunt
-inițiate outbound.
+lobby-urile, deschide listener-ele locale, publică recordurile LAN, validează
+`REQJOIN`, deschide sesiunea WSS și traduce roster-ul coordonat în răspunsuri
+W3GS locale. Toate conexiunile către server sunt inițiate outbound.
 
 ### `Strajer.app`
 
@@ -58,6 +61,9 @@ numărul de jocuri și detectarea unui `REQJOIN` valid. Endpoint-ul este inclus 
 4. Publică serviciul `_blizzard._udp` ca Bonjour `LocalOnly`, cu subtype-ul versiunii Warcraft și record DNS type `66`.
 5. Warcraft afișează lobby-ul în `Local Area Network`.
 6. La `Join`, Warcraft se conectează la listener-ul agentului.
+7. Agentul autentifică o sesiune WSS la server, primește player ID-ul și roster-ul.
+8. Agentul răspunde local cu `SLOTINFOJOIN`, `PLAYERINFO`, profile/skins și
+   `MAPCHECK`, apoi aplică update-urile de roster în lobby-ul Warcraft.
 
 `LocalOnly` este intenționat: fiecare Mac trebuie să vadă numai proxy-ul său
 local, chiar dacă mai multe Mac-uri Strajer sunt în același LAN. Serverul Linux
@@ -66,8 +72,8 @@ rămâne singurul loc în care sesiunile celor două proxy-uri sunt reunite.
 ## Evoluția transportului
 
 - Milestone 0: HTTP polling pentru catalog și listener local de diagnostic.
-- Milestone 1: control persistent + tunel binar WSS autentificat pe `443/tcp`.
-- Milestone 2: actor per lobby și host engine W3GS autoritativ.
+- Milestone 1 curent: control persistent WSS autentificat pe `443/tcp`.
+- Milestone 2 curent: registry de lobby server-side și proiecție W3GS locală.
 - Milestone 3: start, action loop și replay.
 - Milestone 4: QUIC pe `443/udp`, WSS fallback și reconectare măsurată.
 

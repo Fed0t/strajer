@@ -37,5 +37,7 @@
     <string>Strajer publishes Warcraft III games in Local Area Network.</string>
     <key>StrajerServerURL</key>
     <string>http://127.0.0.1:18080</string>
+    <key>StrajerJoinToken</key>
+    <string></string>
 </dict>
 </plist>

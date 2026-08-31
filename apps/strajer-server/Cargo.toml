@@ -9,12 +9,16 @@ publish = false
 anyhow.workspace = true
 axum.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 strajer-protocol = { path = "../../crates/strajer-protocol" }
+subtle.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
 tower.workspace = true

@@ -61,10 +61,12 @@ Criteriu de ieșire:
 
 - două Mac-uri trimit `REQJOIN` valid aceluiași lobby Linux, fără port forwarding pe clienți.
 
-Status la 30 august 2026: framing-ul incremental și parserul tolerant `REQJOIN`
-sunt integrate în agent, descriptorul DotA real este verificat și aplicația
-afișează detectarea unui join valid. Fixture-ul Reforged real, tunnel-ul și
-autentificarea rămân deschise.
+Status la 31 august 2026: framing-ul incremental și parserul tolerant `REQJOIN`
+sunt integrate în agent, descriptorul DotA real este verificat, iar canalul WSS
+autentificat sincronizează două sesiuni de agent prin server. Token-ul comun
+inclus în bundle este doar hardening pentru private beta; identitatea per
+instalare, token-urile scurte, metricile și data-plane-ul de gameplay rămân
+deschise.
 
 Specificația tehnică, deciziile de transport și criteriile intermediare J0–J4
 sunt detaliate în [Plan pentru join W3GS real](join-plan.md).
@@ -84,6 +86,12 @@ Livrabile:
 Criteriu de ieșire:
 
 - doi jucători apar reciproc în lobby, iar sloturile rămân sincronizate după reconnect.
+
+Status la 31 august 2026: serverul alocă determinist player ID și slot, iar
+agentul emite `SLOTINFOJOIN`, `PLAYERINFO`, profile/skins Reforged, `MAPCHECK`,
+update de roster și cleanup la leave. Fluxul a fost validat local în UI cu o a
+doua sesiune WSS sintetică. Validarea pe două Mac-uri reale rămâne blocată numai
+de deploy-ul versiunii noi a containerului public.
 
 ## Milestone 3 — Joc complet
 

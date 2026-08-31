@@ -7,6 +7,7 @@ services:
       RUST_LOG: ${STRAJER_RUST_LOG:-strajer_server=info,tower_http=info}
       STRAJER_BIND_ADDR: 0.0.0.0:8080
       STRAJER_HEALTHCHECK_ADDR: 127.0.0.1:8080
+      STRAJER_JOIN_TOKEN: ${STRAJER_JOIN_TOKEN:?Set STRAJER_JOIN_TOKEN in .env}
     ports:
       - "${STRAJER_PUBLISH_ADDR:-127.0.0.1}:${STRAJER_PORT:-18080}:8080"
     read_only: true

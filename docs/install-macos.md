@@ -2,18 +2,26 @@
 
 ## Build distributabil
 
-Endpoint-ul serverului este inclus în aplicație; utilizatorul nu configurează nimic:
+Endpoint-ul serverului și token-ul private-beta sunt incluse în aplicație;
+utilizatorul final nu configurează nimic. Pe Mac-ul de build, citește token-ul
+fără echo și folosește exact valoarea din `.env` de pe server:
 
 ```bash
-STRAJER_SERVER_URL=https://strajer.example.com \
-  scripts/build-macos-app.sh
+read -s "STRAJER_JOIN_TOKEN?Strajer join token: "
+export STRAJER_JOIN_TOKEN
+STRAJER_SERVER_URL=https://strajer.clarixpro.com scripts/build-macos-app.sh
+unset STRAJER_JOIN_TOKEN
 
 scripts/package-macos-app.sh
 ```
 
 Rezultatul este `dist/Strajer-0.1.0-macos-universal.zip`, compatibil cu Apple Silicon și Intel.
 
-Nu copia build-ul implicit bazat pe `127.0.0.1`: pe al doilea Mac ar afișa `Unavailable`. Pentru utilizare între rețele, reconstruiește aplicația cu URL-ul HTTPS public al containerului Linux.
+Nu copia build-ul implicit bazat pe `127.0.0.1`: pe al doilea Mac ar afișa
+`Unavailable`. Un build public fără token este refuzat de script. Token-ul este
+stocat în `Info.plist`, deci poate fi extras de un utilizator local; această
+protecție este potrivită numai pentru private beta, nu înlocuiește identitatea per
+instalare și Keychain.
 
 Validează checksum-ul înainte de copiere:
 
@@ -30,5 +38,7 @@ shasum -a 256 -c Strajer-0.1.0-macos-universal.zip.sha256
 4. Acceptă permisiunea `Local Network` dacă macOS o cere.
 5. Iconița shield apare în menu bar; meniul trebuie să afișeze `Connected` și numărul de jocuri.
 6. Pornește Warcraft III normal și intră în `Local Area Network`.
+7. Ambii jucători aleg `Strajer Test #1`; după join trebuie să apară `2/11` și
+   ambele nume în sloturi.
 
 Build-ul local este semnat ad-hoc. Distribuția fără avertisment Gatekeeper necesită certificat Apple Developer ID, hardened runtime și notarizare Apple.

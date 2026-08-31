@@ -83,14 +83,15 @@ fn encode_game_data(lobby: &LobbyDescriptor, local_port: u16) -> Result<Vec<u8>,
 
 fn encode_game_settings(lobby: &LobbyDescriptor) -> Result<Vec<u8>, LanError> {
     let map_sha1 = lobby.map.sha1_bytes()?;
-    let mut settings = Vec::with_capacity(lobby.map.path.len() + HOST_NAME.len() + 36);
+    let map_path = lobby.map.path.replace('\\', "/");
+    let mut settings = Vec::with_capacity(map_path.len() + HOST_NAME.len() + 36);
 
     settings.extend_from_slice(&DEFAULT_GAME_SETTING_FLAGS.to_le_bytes());
     settings.push(0);
     settings.extend_from_slice(&lobby.map.width.to_le_bytes());
     settings.extend_from_slice(&lobby.map.height.to_le_bytes());
     settings.extend_from_slice(&lobby.map.checksum.to_le_bytes());
-    push_c_string(&mut settings, &lobby.map.path);
+    push_c_string(&mut settings, &map_path);
     push_c_string(&mut settings, HOST_NAME);
     settings.push(0);
     settings.extend_from_slice(&map_sha1);
@@ -167,6 +168,45 @@ mod tests {
         assert!(game_data.starts_with(b"Strajer Test #1\0\0"));
         assert_eq!(&game_data[game_data.len() - 2..], &16_000_u16.to_le_bytes());
         assert!(!game_data["Strajer Test #1\0\0".len()..game_data.len() - 11].contains(&0));
+
+        let encoded_settings_start = "Strajer Test #1\0\0".len();
+        let encoded_settings_end = game_data[encoded_settings_start..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .expect("encoded settings should be null terminated")
+            + encoded_settings_start;
+        let settings =
+            decode_stat_string_for_test(&game_data[encoded_settings_start..encoded_settings_end]);
+        assert!(
+            String::from_utf8_lossy(&settings).contains("Maps/Strajer/Synthetic.w3x"),
+            "Bonjour map paths must use Warcraft's forward-slash wire format"
+        );
+    }
+
+    fn decode_stat_string_for_test(source: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(source.len());
+        let mut position = 0;
+
+        while position < source.len() {
+            let control = source[position];
+            position += 1;
+
+            for bit in 1..=7 {
+                if position == source.len() {
+                    break;
+                }
+
+                let byte = source[position];
+                position += 1;
+                if control & (1 << bit) == 0 {
+                    output.push(byte.wrapping_sub(1));
+                } else {
+                    output.push(byte);
+                }
+            }
+        }
+
+        output
     }
 
     fn test_lobby() -> LobbyDescriptor {

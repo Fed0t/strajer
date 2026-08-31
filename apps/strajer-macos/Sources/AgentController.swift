@@ -46,6 +46,7 @@ final class AgentController: ObservableObject {
     @Published private(set) var status: AgentStatus = .connecting
     @Published private(set) var availableGames = 0
     @Published private(set) var joinRequestCaptured = false
+    @Published private(set) var lobbyJoined = false
     @Published private(set) var lastError: String?
 
     private var process: Process?
@@ -54,6 +55,7 @@ final class AgentController: ObservableObject {
     private var standardErrorPipe: Pipe?
     private var standardOutputBuffer = Data()
     private var standardErrorBuffer = Data()
+    private var logFileHandle: FileHandle?
     private var restartTask: Task<Void, Never>?
     private var shouldRun = false
     private var restartImmediately = false
@@ -62,6 +64,8 @@ final class AgentController: ObservableObject {
         shouldRun = true
         restartTask?.cancel()
         restartTask = nil
+
+        openLogFileIfNeeded()
 
         guard process == nil else {
             return
@@ -84,6 +88,7 @@ final class AgentController: ObservableObject {
         status = .connecting
         availableGames = 0
         joinRequestCaptured = false
+        lobbyJoined = false
         lastError = nil
         process.terminate()
     }
@@ -98,15 +103,18 @@ final class AgentController: ObservableObject {
         process?.terminationHandler = nil
         process?.terminate()
         process = nil
+        closeLogFile()
     }
 
     private func launchAgent() {
         status = .connecting
         availableGames = 0
         joinRequestCaptured = false
+        lobbyJoined = false
         lastError = nil
         standardOutputBuffer.removeAll(keepingCapacity: true)
         standardErrorBuffer.removeAll(keepingCapacity: true)
+        appendLogMarker("Launching agent")
 
         do {
             let agentURL = try resolveAgentURL()
@@ -160,6 +168,12 @@ final class AgentController: ObservableObject {
             environment["STRAJER_SERVER_URL"] = serverURL
         }
 
+        if environment["STRAJER_JOIN_TOKEN"] == nil,
+           let joinToken = Bundle.main.object(forInfoDictionaryKey: "StrajerJoinToken") as? String,
+           !joinToken.isEmpty {
+            environment["STRAJER_JOIN_TOKEN"] = joinToken
+        }
+
         return environment
     }
 
@@ -210,6 +224,7 @@ final class AgentController: ObservableObject {
     }
 
     private func consumeStandardOutput(_ data: Data) {
+        appendLogData(data)
         standardOutputBuffer.append(data)
 
         while let newlineIndex = standardOutputBuffer.firstIndex(of: 0x0A) {
@@ -237,12 +252,19 @@ final class AgentController: ObservableObject {
                 return
             }
             joinRequestCaptured = true
+        case "lobby_joined":
+            guard event.lobbyID != nil else {
+                return
+            }
+            joinRequestCaptured = true
+            lobbyJoined = true
         default:
             return
         }
     }
 
     private func consumeStandardError(_ data: Data) {
+        appendLogData(data)
         standardErrorBuffer.append(data)
         let maximumBytes = 8_192
         if standardErrorBuffer.count > maximumBytes {
@@ -297,7 +319,72 @@ final class AgentController: ObservableObject {
         status = .unavailable
         availableGames = 0
         joinRequestCaptured = false
+        lobbyJoined = false
         lastError = message
+    }
+
+    private func openLogFileIfNeeded() {
+        guard logFileHandle == nil else {
+            return
+        }
+
+        do {
+            let fileManager = FileManager.default
+            let logsDirectory = try fileManager.url(
+                for: .libraryDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )
+            .appendingPathComponent("Logs", isDirectory: true)
+            .appendingPathComponent("Strajer", isDirectory: true)
+            try fileManager.createDirectory(
+                at: logsDirectory,
+                withIntermediateDirectories: true
+            )
+
+            let logFileURL = logsDirectory.appendingPathComponent("agent.log")
+            if !fileManager.fileExists(atPath: logFileURL.path) {
+                guard fileManager.createFile(atPath: logFileURL.path, contents: nil) else {
+                    throw AgentControllerError.logFileCreationFailed(logFileURL.path)
+                }
+            }
+
+            let fileHandle = try FileHandle(forWritingTo: logFileURL)
+            try fileHandle.seekToEnd()
+            logFileHandle = fileHandle
+            appendLogMarker("Strajer started")
+        } catch {
+            logFileHandle = nil
+        }
+    }
+
+    private func appendLogMarker(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let marker = "\n[\(timestamp)] \(message)\n"
+        guard let data = marker.data(using: .utf8) else {
+            return
+        }
+
+        appendLogData(data)
+    }
+
+    private func appendLogData(_ data: Data) {
+        guard let logFileHandle else {
+            return
+        }
+
+        do {
+            try logFileHandle.write(contentsOf: data)
+        } catch {
+            try? logFileHandle.close()
+            self.logFileHandle = nil
+        }
+    }
+
+    private func closeLogFile() {
+        try? logFileHandle?.close()
+        logFileHandle = nil
     }
 
     private func scheduleRestart() {
@@ -319,11 +406,14 @@ final class AgentController: ObservableObject {
 
 private enum AgentControllerError: LocalizedError {
     case agentExecutableMissing(String)
+    case logFileCreationFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .agentExecutableMissing(let path):
             return "Embedded agent is missing or not executable: \(path)"
+        case .logFileCreationFailed(let path):
+            return "Could not create the agent log file: \(path)"
         }
     }
 }
