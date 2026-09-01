@@ -62,7 +62,11 @@ verificate incrucisat astfel:
   compararea checksum-urilor numai dupa ce fiecare player activ are o valoare.
   `EventPlayerLoaded` publica `GAMELOADED_OTHERS` tuturor sesiunilor, inclusiv
   sesiunii care a trimis `GAMELOADED_SELF`; Warcraft asteapta confirmarea
-  coordonata pentru fiecare PID inainte de primul timeslot.
+  coordonata pentru fiecare PID inainte de primul timeslot. Pentru chatul din
+  lobby, `EventPlayerChatToHost` retransmite `CHAT_FROM_HOST` catre lista de PID
+  din frame, inclusiv expeditorul cand acesta este destinatar; Strajer pastreaza
+  acelasi echo autoritativ si elimina frame-urile identice emise aproape
+  simultan de clientul Reforged verificat.
 
 Implementările publice clasice nu sunt tratate drept dovadă că Reforged păstrează
 identic fiecare câmp. Fixture-urile build-ului local au prioritate când există o

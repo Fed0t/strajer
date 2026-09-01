@@ -90,9 +90,20 @@ private struct StrajerMenuView: View {
             } else if controller.joinRequestCaptured {
                 Text("Join request detected")
             }
+
+            if let lobbyStatusMessage = controller.lobbyStatusMessage {
+                Text(lobbyStatusMessage)
+                    .lineLimit(2)
+            }
         }
 
-        if let lastError = controller.lastError, controller.status == .unavailable {
+        if let retryDelaySeconds = controller.retryDelaySeconds,
+           controller.status == .reconnecting {
+            Text("Retry in \(retryDelaySeconds)s")
+        }
+
+        if let lastError = controller.lastError,
+           controller.status == .unavailable || controller.status == .reconnecting {
             Text(lastError)
                 .lineLimit(2)
         }

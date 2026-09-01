@@ -21,7 +21,8 @@ use url::Url;
 
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-const REMOTE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const REMOTE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const REMOTE_SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_REMOTE_WEBSOCKET_MESSAGE_BYTES: usize =
     if MAX_LOBBY_CONTROL_MESSAGE_BYTES > MAX_GAME_TUNNEL_MESSAGE_BYTES {
         MAX_LOBBY_CONTROL_MESSAGE_BYTES
@@ -37,6 +38,7 @@ pub(crate) struct RemoteLobbySession {
     initial_roster: LobbyRoster,
     maximum_players: u8,
     heartbeat_interval: Interval,
+    last_server_activity: Instant,
     ready_sent: bool,
     loaded_sent: bool,
     last_sent_game_sequence: u64,
@@ -165,6 +167,7 @@ impl RemoteLobbySession {
             initial_roster: roster,
             maximum_players: lobby.human_player_capacity(),
             heartbeat_interval,
+            last_server_activity: Instant::now(),
             ready_sent: false,
             loaded_sent: false,
             last_sent_game_sequence: 0,
@@ -235,6 +238,7 @@ impl RemoteLobbySession {
                     let message = message.context(
                         "could not read coordinated lobby WebSocket"
                     )?;
+                    self.last_server_activity = Instant::now();
                     let Some(message) = handle_server_websocket_message(
                         &mut self.socket,
                         message,
@@ -253,6 +257,17 @@ impl RemoteLobbySession {
                     }
                 }
                 _ = self.heartbeat_interval.tick() => {
+                    let now = Instant::now();
+                    if remote_server_idle_timed_out(
+                        self.last_server_activity,
+                        now,
+                        REMOTE_SERVER_IDLE_TIMEOUT,
+                    ) {
+                        bail!(
+                            "coordinated lobby server heartbeat timed out after {} seconds",
+                            REMOTE_SERVER_IDLE_TIMEOUT.as_secs()
+                        );
+                    }
                     self.socket
                         .send(Message::Ping(Vec::new().into()))
                         .await
@@ -363,6 +378,14 @@ impl RemoteLobbySession {
         self.last_received_game_sequence = sequence;
         Ok(Some(RemoteLobbyEvent::GameFrame(frame)))
     }
+}
+
+fn remote_server_idle_timed_out(
+    last_server_activity: Instant,
+    now: Instant,
+    idle_timeout: Duration,
+) -> bool {
+    now.saturating_duration_since(last_server_activity) >= idle_timeout
 }
 
 fn websocket_request(endpoint: &Url, join_token: Option<&str>) -> Result<Request<()>> {
@@ -487,6 +510,23 @@ mod tests {
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
+    fn detects_remote_server_idle_timeout_at_the_exact_deadline() {
+        let last_activity = Instant::now();
+        let idle_timeout = Duration::from_secs(35);
+
+        assert!(!remote_server_idle_timed_out(
+            last_activity,
+            last_activity + idle_timeout - Duration::from_millis(1),
+            idle_timeout,
+        ));
+        assert!(remote_server_idle_timed_out(
+            last_activity,
+            last_activity + idle_timeout,
+            idle_timeout,
+        ));
+    }
+
+    #[test]
     fn builds_secure_lobby_endpoint_and_escapes_the_lobby_id() {
         let endpoint = lobby_session_endpoint("https://strajer.example.com/", "lobby/one")
             .expect("endpoint should build");
@@ -602,6 +642,16 @@ mod tests {
             receive_chat(&mut first).await,
             (2, "hello first player".to_owned())
         );
+        assert_eq!(
+            receive_chat(&mut second).await,
+            (2, "hello first player".to_owned())
+        );
+        second
+            .send_chat("hello first player".to_owned())
+            .await
+            .expect("duplicate chat should send");
+        assert_no_remote_event(&mut first).await;
+        assert_no_remote_event(&mut second).await;
 
         first.mark_ready().await.expect("first should become ready");
         second
@@ -742,5 +792,14 @@ mod tests {
         })
         .await
         .expect("expected countdown should arrive")
+    }
+
+    async fn assert_no_remote_event(session: &mut RemoteLobbySession) {
+        assert!(
+            timeout(Duration::from_millis(100), session.next_event())
+                .await
+                .is_err(),
+            "duplicate chat must not produce another remote event"
+        );
     }
 }

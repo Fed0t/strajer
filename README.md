@@ -17,8 +17,9 @@ Primul vertical slice implementează:
 - un frame reader W3GS incremental și validarea sigură a `REQJOIN`;
 - răspunsurile W3GS necesare intrării în lobby și sincronizarea live a roster-ului;
 - un host virtual `Strajer` în slotul `HOSTBOT`, separat de cele 10 sloturi umane;
-- chat lobby bidirectional intre jucatorii conectati, cu identitatea expeditorului
-  validata de agent si derivata server-side din sesiunea autentificata;
+- chat lobby bidirectional si exact-once intre jucatorii conectati, inclusiv
+  echo autoritativ catre expeditor, cu identitatea validata de agent si derivata
+  server-side din sesiunea autentificata;
 - confirmare de hartă per client și countdown server-side de 60 secunde, cu mesaj
   W3GS la fiecare 10 secunde, anulare la leave și tranziție sincronă spre loading;
 - start automat la 10/10 jucatori sau fallback `!start` de la minimum doi
@@ -37,6 +38,13 @@ Primul vertical slice implementează:
 
 Intrarea in lobby, map download-ul si fluxul autoritativ
 `join -> countdown -> loading -> gameplay -> cleanup` sunt implementate.
+Aplicatia supravegheaza agentul cu backoff exponential bounded si jitter,
+republica lobby-urile dupa schimbarea retelei si roteste automat logul local.
+Fiecare conexiune Warcraft are un ID local corelat cu statusul din menu bar, iar
+inchiderea unei sesiuni sterge numai starea acelui join. WSS foloseste heartbeat
+bidirectional si watchdog-uri bounded: agentul detecteaza lipsa serverului in
+maximum aproximativ 35 secunde, iar serverul elibereaza un client half-open in
+maximum aproximativ 45 secunde.
 Action loop-ul si lifecycle-ul sunt validate automat; validarea live de 15
 minute pe doua Mac-uri si replay-ul `.w3g` raman gate-uri deschise. Harta nu mai trebuie preinstalată pe Mac: serverul o
 distribuie agentului, iar agentul o livrează către Warcraft prin protocolul W3GS.
@@ -101,5 +109,6 @@ producție.
 - [Validarea milestone-ului M0](docs/validation-m0.md)
 - [Instalare pe alt Mac](docs/install-macos.md)
 - [Deploy Linux și Nginx Proxy Manager](docs/deploy-linux.md)
+- [Runbook Private Beta](docs/private-beta-runbook.md)
 - [Review și gate-uri de producție](docs/production-review.md)
 - [Notificări third-party](THIRD_PARTY_NOTICES.md)

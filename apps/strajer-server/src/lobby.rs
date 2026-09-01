@@ -17,6 +17,7 @@ const MINIMUM_MANUAL_START_PLAYERS: usize = 2;
 const MAX_PENDING_GAME_ACTIONS: usize = 512;
 const MAX_PENDING_GAME_ACTION_BYTES: usize = 512 * 1_452;
 const MAX_PENDING_CHECKSUMS_PER_PLAYER: usize = 64;
+const LOBBY_CHAT_DUPLICATE_WINDOW: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub(crate) struct LobbyRegistry {
@@ -159,6 +160,7 @@ impl LobbyRoom {
                 name: player_name,
                 ready: false,
                 loaded: false,
+                last_chat: None,
                 last_game_sequence: 0,
                 checksums: VecDeque::new(),
             },
@@ -308,15 +310,28 @@ impl LobbyRoom {
         player_id: u8,
         session_id: u64,
         message: String,
-    ) -> Result<(), LobbyMembershipError> {
-        let state = self.state.lock().await;
-        state.require_active_session(player_id, session_id)?;
+    ) -> Result<bool, LobbyMembershipError> {
+        let mut state = self.state.lock().await;
+        let player = state
+            .players
+            .get_mut(&player_id)
+            .filter(|player| player.session_id == session_id)
+            .ok_or(LobbyMembershipError::UnknownSession)?;
+        let now = Instant::now();
+        if player.is_duplicate_chat(&message, now) {
+            return Ok(false);
+        }
+        player.last_chat = Some(RecentChat {
+            message: message.clone(),
+            received_at: now,
+        });
+        drop(state);
+
         let _ = self.updates.send(LobbyUpdate::Chat {
             from_player_id: player_id,
             message,
         });
-        drop(state);
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) async fn request_manual_start(
@@ -880,8 +895,25 @@ struct ConnectedPlayer {
     name: String,
     ready: bool,
     loaded: bool,
+    last_chat: Option<RecentChat>,
     last_game_sequence: u64,
     checksums: VecDeque<u32>,
+}
+
+impl ConnectedPlayer {
+    fn is_duplicate_chat(&self, message: &str, now: Instant) -> bool {
+        let Some(last_chat) = &self.last_chat else {
+            return false;
+        };
+
+        last_chat.message == message
+            && now.duration_since(last_chat.received_at) <= LOBBY_CHAT_DUPLICATE_WINDOW
+    }
+}
+
+struct RecentChat {
+    message: String,
+    received_at: Instant,
 }
 
 #[derive(Clone, Copy)]

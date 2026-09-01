@@ -12,7 +12,7 @@ Actualizat: 31 august 2026.
 ## Verificări reușite
 
 - `cargo fmt --all --check`;
-- `cargo test --workspace --all-targets`: 83 teste trecute pentru protocol,
+- `cargo test --workspace --all-targets`: 100 teste trecute pentru protocol,
   framing W3GS, LAN, server, agent, chat, countdown, load sync si map transfer;
 - `cargo clippy --workspace --all-targets -- -D warnings`;
 - build Linux al imaginii `strajer-strajer-server` din `Cargo.lock`;
@@ -33,17 +33,18 @@ Actualizat: 31 august 2026.
   greșite `selectedGame` cu `selectedGameId` si cele sapte valori initiale de
   nickname; testul Swift trece pe fixture-ul real `GlueManager.js`; după restart, Join-ul offline a
   produs `REQJOIN`, `lobby_joined` și un roster coordonat de doi jucători;
-- heartbeat-ul WSS la 30 s mentine lobby-ul public activ peste 128 s, depasind
-  timeout-ul idle vechi de aproximativ 90 s fara reconnect sau eroare;
+- heartbeat-ul WSS este bidirectional la 10 s din agent si 15 s din server;
+  watchdog-urile deterministe detecteaza serverul inactiv la 35 s si clientul
+  half-open la 45 s;
 - doua Mac-uri au intrat simultan in acelasi lobby coordonat;
 - agentul de pe Mac-ul fara asset a descarcat si verificat harta in cache;
 - serverul rezerva 10 sloturi umane, iar agentul ocupa slotul final `HOSTBOT` cu
   playerul virtual `Strajer`;
 - serverul testeaza countdown-ul 60/50/40/30/20/10, anularea la leave si startul
   numai dupa ready pentru toti jucatorii;
-- testele end-to-end WSS valideaza chatul in ambele directii fara echo spre
-  expeditor si `!start` armat inainte de ready pentru un lobby partial cu doi
-  jucatori;
+- testele end-to-end WSS valideaza chatul exact-once pe ambele sesiuni, inclusiv
+  echo autoritativ spre expeditor si deduplicarea frame-urilor identice, plus
+  `!start` armat inainte de ready pentru un lobby partial cu doi jucatori;
 - serverul valideaza ca `loaded` este acceptat numai dupa start, este idempotent
   si publica fiecare PID uman o singura data; codec-ul valideaza frame-ul
   `GAMELOADED_SELF` si genereaza `GAMELOADED_OTHERS`;
@@ -55,7 +56,7 @@ Actualizat: 31 august 2026.
 ## Încă nevalidate
 
 - deploy-ul coordonat schema catalog `3` / session protocol `5`;
-- afisarea live a chatului bidirectional si validarea `!start` pe ambele Mac-uri;
+- revalidarea live a fixului chat exact-once si a `!start` pe ambele Mac-uri;
 - afisarea live `Strajer` in `HOSTBOT` si countdown-ul chat pe ambele Mac-uri;
 - tranzitia live simultana a celor 10 clienti spre loading;
 - load sync uman live pe doua Mac-uri;

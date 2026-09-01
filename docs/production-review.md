@@ -16,8 +16,8 @@ nu a trecut gate-ul live de 15 minute pe doua Mac-uri si nu genereaza replay.
 - catalog HTTPS si sesiune WSS autentificata;
 - map download autentificat, cache atomic verificat SHA-1/CRC32 si transfer W3GS;
 - 10 sloturi umane plus `Strajer` in slotul final `HOSTBOT`;
-- chat lobby bidirectional, cu PID validat local si identitate derivata din
-  sesiunea autentificata pe server;
+- chat lobby bidirectional exact-once, cu echo autoritativ, PID validat local,
+  deduplicare bounded si identitate derivata din sesiunea autentificata;
 - ready dupa verificarea hartii, countdown autoritativ
   `60/50/40/30/20/10`, start automat la 10/10, fallback `!start` de la doi
   jucatori, anulare la leave si tranzitie spre loading;
@@ -30,13 +30,19 @@ nu a trecut gate-ul live de 15 minute pe doua Mac-uri si nu genereaza replay.
 - consensus pentru `OUTGOING_KEEPALIVE`, terminare determinista la desync,
   leave/disconnect in-game, game-over si reset de lobby;
 - nickname persistent si actiunea `Nickname...` in menu bar;
+- supervisor macOS cu status `Reconnecting`, backoff exponential 2-60 secunde
+  cu jitter, restart dupa schimbarea retelei si rotatie bounded a logului;
+- lifecycle UI corelat prin `connection_id`, astfel incat evenimentele tardive
+  nu pot suprascrie starea join-ului activ;
+- heartbeat WSS bidirectional la 10/15 secunde, watchdog client de 35 secunde si
+  watchdog server de 45 secunde pentru cleanup bounded al conexiunilor half-open;
 - refuz strict al unui WebUI Blizzard care nu are semnatura cunoscuta exact;
 - container Linux non-root, read-only, fara capabilitati si cu healthcheck;
 - build macOS universal `arm64` + `x86_64`, verificat prin `codesign` ad-hoc.
 
-Validarea curenta are 96 de teste Rust, testul Swift pe fixture-ul WebUI real,
-`cargo clippy -D warnings`, verificarea Docker Compose, build-ul imaginii Docker
-si verificarea bundle-ului/ZIP-ului macOS.
+Validarea curenta are 100 de teste Rust, suite Swift pentru fixture-ul WebUI,
+lifecycle, backoff si log rotation, `cargo clippy -D warnings`, verificarea Docker Compose,
+build-ul imaginii Docker si verificarea bundle-ului/ZIP-ului macOS.
 
 ## P0 - gate-uri pentru un joc real
 
@@ -75,10 +81,12 @@ Keychain, access token scurt si rotabil, plus rate limiting in proxy si server.
 
 ### Rezilienta clientului
 
-- Agentul citeste catalogul numai la pornire si nu recupereaza automat dupa
-  schimbarea retelei, pierderea WSS sau modificarea catalogului.
-- Restartul este fix la 5 secunde, fara exponential backoff si jitter.
-- `agent.log` nu are rotatie sau limita de marime.
+- Agentul recupereaza discovery-ul dupa schimbarea retelei si verifica periodic
+  modificarile catalogului, pe care le aplica printr-un restart controlat.
+- Pierderea WSS este detectata bounded, inchide controlat sesiunea, elibereaza
+  slotul si curata starea din menu bar. Utilizatorul poate reintra din LAN fara
+  restart Strajer; transparent session resume in timpul partidei, cu ACK,
+  secvente si buffer de timeslot-uri, nu este inca implementat.
 - Numarul din catalog ramane static si nu reflecta ocuparea live a lobby-ului.
 
 ### Release macOS

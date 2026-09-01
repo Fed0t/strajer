@@ -1,9 +1,11 @@
 import Combine
 import Foundation
+import Network
 
 enum AgentStatus: Equatable {
     case connecting
     case connected
+    case reconnecting
     case unavailable
 
     var description: String {
@@ -12,6 +14,8 @@ enum AgentStatus: Equatable {
             return "Connecting"
         case .connected:
             return "Connected"
+        case .reconnecting:
+            return "Reconnecting"
         case .unavailable:
             return "Unavailable"
         }
@@ -23,6 +27,8 @@ enum AgentStatus: Equatable {
             return "shield.lefthalf.filled"
         case .connected:
             return "shield.fill"
+        case .reconnecting:
+            return "shield.lefthalf.filled"
         case .unavailable:
             return "shield.slash"
         }
@@ -34,12 +40,16 @@ private struct AgentStatusEvent: Decodable {
     let lobbyCount: Int?
     let lobbyID: String?
     let nickname: String?
+    let connectionID: UInt64?
+    let outcome: String?
 
     private enum CodingKeys: String, CodingKey {
         case event
         case lobbyCount = "lobby_count"
         case lobbyID = "lobby_id"
         case nickname
+        case connectionID = "connection_id"
+        case outcome
     }
 }
 
@@ -49,7 +59,9 @@ final class AgentController: ObservableObject {
     @Published private(set) var availableGames = 0
     @Published private(set) var joinRequestCaptured = false
     @Published private(set) var lobbyJoined = false
+    @Published private(set) var lobbyStatusMessage: String?
     @Published private(set) var lastError: String?
+    @Published private(set) var retryDelaySeconds: Int?
 
     private var process: Process?
     private var standardInputPipe: Pipe?
@@ -58,10 +70,23 @@ final class AgentController: ObservableObject {
     private var standardOutputBuffer = Data()
     private var standardErrorBuffer = Data()
     private var logFileHandle: FileHandle?
+    private var logFileURL: URL?
+    private var logFileSize: UInt64 = 0
     private var restartTask: Task<Void, Never>?
+    private var networkRestartTask: Task<Void, Never>?
     private var shouldRun = false
     private var restartImmediately = false
+    private var consecutiveFailures = 0
+    private var networkPathObserved = false
+    private var networkAvailable = true
+    private var networkMonitorStarted = false
+    private var lobbyLifecycle = AgentLobbyLifecycle()
     private let nicknameController: NicknameController
+    private let restartPolicy = AgentRestartPolicy()
+    private let networkMonitor = NWPathMonitor()
+    private let networkMonitorQueue = DispatchQueue(label: "com.clarixpro.strajer.network")
+    private let maximumLogFileBytes: UInt64 = 5 * 1_024 * 1_024
+    private let retainedLogFileCount = 3
 
     init(nicknameController: NicknameController) {
         self.nicknameController = nicknameController
@@ -71,6 +96,7 @@ final class AgentController: ObservableObject {
         shouldRun = true
         restartTask?.cancel()
         restartTask = nil
+        startNetworkMonitoring()
 
         openLogFileIfNeeded()
 
@@ -85,6 +111,8 @@ final class AgentController: ObservableObject {
         shouldRun = true
         restartTask?.cancel()
         restartTask = nil
+        consecutiveFailures = 0
+        retryDelaySeconds = nil
 
         guard let process else {
             launchAgent()
@@ -94,8 +122,7 @@ final class AgentController: ObservableObject {
         restartImmediately = true
         status = .connecting
         availableGames = 0
-        joinRequestCaptured = false
-        lobbyJoined = false
+        resetLobbyLifecycle()
         lastError = nil
         process.terminate()
     }
@@ -105,6 +132,9 @@ final class AgentController: ObservableObject {
         restartImmediately = false
         restartTask?.cancel()
         restartTask = nil
+        networkRestartTask?.cancel()
+        networkRestartTask = nil
+        stopNetworkMonitoring()
         removePipeHandlers()
 
         process?.terminationHandler = nil
@@ -116,9 +146,9 @@ final class AgentController: ObservableObject {
     private func launchAgent() {
         status = .connecting
         availableGames = 0
-        joinRequestCaptured = false
-        lobbyJoined = false
+        resetLobbyLifecycle()
         lastError = nil
+        retryDelaySeconds = nil
         standardOutputBuffer.removeAll(keepingCapacity: true)
         standardErrorBuffer.removeAll(keepingCapacity: true)
         appendLogMarker("Launching agent")
@@ -258,17 +288,37 @@ final class AgentController: ObservableObject {
             status = .connected
             availableGames = lobbyCount
             lastError = nil
+            retryDelaySeconds = nil
+            consecutiveFailures = 0
         case "join_request_captured":
-            guard event.lobbyID != nil else {
+            guard event.lobbyID != nil, let connectionID = event.connectionID else {
                 return false
             }
-            joinRequestCaptured = true
+            if lobbyLifecycle.captureJoinRequest(connectionID: connectionID) {
+                lobbyStatusMessage = nil
+                publishLobbyLifecycle()
+            }
         case "lobby_joined":
-            guard event.lobbyID != nil else {
+            guard event.lobbyID != nil, let connectionID = event.connectionID else {
                 return false
             }
-            joinRequestCaptured = true
-            lobbyJoined = true
+            if lobbyLifecycle.markLobbyJoined(connectionID: connectionID) {
+                lobbyStatusMessage = nil
+                publishLobbyLifecycle()
+            }
+        case "lobby_session_ended":
+            guard event.lobbyID != nil,
+                  let connectionID = event.connectionID,
+                  let outcome = event.outcome,
+                  outcome == "closed" || outcome == "error" else {
+                return false
+            }
+            if lobbyLifecycle.endSession(connectionID: connectionID) {
+                lobbyStatusMessage = outcome == "error"
+                    ? "Lobby disconnected; rejoin in Warcraft"
+                    : nil
+                publishLobbyLifecycle()
+            }
         case "nickname_captured":
             guard let nickname = event.nickname else {
                 return true
@@ -303,8 +353,21 @@ final class AgentController: ObservableObject {
             return
         }
 
+        guard networkAvailable else {
+            markUnavailable("Network unavailable")
+            return
+        }
+
         if restartImmediately {
             restartImmediately = false
+            launchAgent()
+            return
+        }
+
+        if terminatedProcess.terminationReason == .exit,
+           terminatedProcess.terminationStatus == 0 {
+            consecutiveFailures = 0
+            appendLogMarker("Agent requested a controlled restart")
             launchAgent()
             return
         }
@@ -337,9 +400,86 @@ final class AgentController: ObservableObject {
     private func markUnavailable(_ message: String) {
         status = .unavailable
         availableGames = 0
-        joinRequestCaptured = false
-        lobbyJoined = false
+        resetLobbyLifecycle()
         lastError = message
+    }
+
+    private func resetLobbyLifecycle() {
+        lobbyLifecycle.reset()
+        lobbyStatusMessage = nil
+        publishLobbyLifecycle()
+    }
+
+    private func publishLobbyLifecycle() {
+        joinRequestCaptured = lobbyLifecycle.joinRequestCaptured
+        lobbyJoined = lobbyLifecycle.lobbyJoined
+    }
+
+    private func startNetworkMonitoring() {
+        guard !networkMonitorStarted else {
+            return
+        }
+
+        networkMonitorStarted = true
+        networkMonitor.pathUpdateHandler = { @Sendable [weak self] path in
+            let isAvailable = path.status == .satisfied
+            Task { @MainActor [weak self] in
+                self?.handleNetworkPathUpdate(isAvailable: isAvailable)
+            }
+        }
+        networkMonitor.start(queue: networkMonitorQueue)
+    }
+
+    private func stopNetworkMonitoring() {
+        guard networkMonitorStarted else {
+            return
+        }
+
+        networkMonitor.pathUpdateHandler = nil
+        networkMonitor.cancel()
+        networkMonitorStarted = false
+    }
+
+    private func handleNetworkPathUpdate(isAvailable: Bool) {
+        let wasObserved = networkPathObserved
+        networkPathObserved = true
+        networkAvailable = isAvailable
+
+        guard shouldRun else {
+            return
+        }
+
+        if !isAvailable {
+            restartTask?.cancel()
+            restartTask = nil
+            networkRestartTask?.cancel()
+            networkRestartTask = nil
+            restartImmediately = false
+            retryDelaySeconds = nil
+            markUnavailable("Network unavailable")
+            process?.terminate()
+            return
+        }
+
+        guard wasObserved else {
+            return
+        }
+
+        scheduleRestartAfterNetworkChange()
+    }
+
+    private func scheduleRestartAfterNetworkChange() {
+        networkRestartTask?.cancel()
+        networkRestartTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled, let self, self.shouldRun, self.networkAvailable else {
+                return
+            }
+
+            self.networkRestartTask = nil
+            self.appendLogMarker("Network path changed; restarting agent")
+            self.restart()
+        }
     }
 
     private func openLogFileIfNeeded() {
@@ -363,6 +503,11 @@ final class AgentController: ObservableObject {
             )
 
             let logFileURL = logsDirectory.appendingPathComponent("agent.log")
+            try AgentLogRotation.rotateIfNeeded(
+                fileURL: logFileURL,
+                maximumBytes: maximumLogFileBytes,
+                retainedFileCount: retainedLogFileCount
+            )
             if !fileManager.fileExists(atPath: logFileURL.path) {
                 guard fileManager.createFile(atPath: logFileURL.path, contents: nil) else {
                     throw AgentControllerError.logFileCreationFailed(logFileURL.path)
@@ -372,9 +517,14 @@ final class AgentController: ObservableObject {
             let fileHandle = try FileHandle(forWritingTo: logFileURL)
             try fileHandle.seekToEnd()
             logFileHandle = fileHandle
+            self.logFileURL = logFileURL
+            let attributes = try fileManager.attributesOfItem(atPath: logFileURL.path)
+            logFileSize = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
             appendLogMarker("Strajer started")
         } catch {
             logFileHandle = nil
+            self.logFileURL = nil
+            logFileSize = 0
         }
     }
 
@@ -394,30 +544,73 @@ final class AgentController: ObservableObject {
     }
 
     private func appendLogData(_ data: Data) {
+        rotateLogFileIfRequired(incomingByteCount: data.count)
         guard let logFileHandle else {
             return
         }
 
         do {
             try logFileHandle.write(contentsOf: data)
+            logFileSize += UInt64(data.count)
         } catch {
             try? logFileHandle.close()
             self.logFileHandle = nil
+            self.logFileURL = nil
+            logFileSize = 0
+        }
+    }
+
+    private func rotateLogFileIfRequired(incomingByteCount: Int) {
+        guard incomingByteCount > 0,
+              logFileSize > 0,
+              logFileSize + UInt64(incomingByteCount) > maximumLogFileBytes,
+              let logFileURL else {
+            return
+        }
+
+        do {
+            try logFileHandle?.close()
+            logFileHandle = nil
+            try AgentLogRotation.rotate(
+                fileURL: logFileURL,
+                retainedFileCount: retainedLogFileCount
+            )
+            guard FileManager.default.createFile(atPath: logFileURL.path, contents: nil) else {
+                throw AgentControllerError.logFileCreationFailed(logFileURL.path)
+            }
+            logFileHandle = try FileHandle(forWritingTo: logFileURL)
+            logFileSize = 0
+        } catch {
+            logFileHandle = nil
+            self.logFileURL = nil
+            logFileSize = 0
         }
     }
 
     private func closeLogFile() {
         try? logFileHandle?.close()
         logFileHandle = nil
+        logFileURL = nil
+        logFileSize = 0
     }
 
     private func scheduleRestart() {
-        guard shouldRun, restartTask == nil else {
+        guard shouldRun, networkAvailable, restartTask == nil else {
             return
         }
 
+        consecutiveFailures += 1
+        let jitterFraction = Double.random(in: 0...restartPolicy.maximumJitterFraction)
+        let delaySeconds = restartPolicy.delaySeconds(
+            forAttempt: consecutiveFailures,
+            jitterFraction: jitterFraction
+        )
+        retryDelaySeconds = Int(ceil(delaySeconds))
+        status = .reconnecting
+        appendLogMarker("Agent restart scheduled in \(retryDelaySeconds ?? 0) seconds")
+
         restartTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(5))
+            try? await Task.sleep(for: .seconds(delaySeconds))
             guard !Task.isCancelled, let self else {
                 return
             }

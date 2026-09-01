@@ -6,6 +6,7 @@ use std::env;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -37,6 +38,7 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:18080";
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(5);
+const CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const JOIN_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_INITIAL_JOIN_FRAME_BYTES: usize = 4_096;
 const MAX_LOBBY_FRAME_BYTES: usize = u16::MAX as usize;
@@ -67,6 +69,8 @@ const DOTA_SLOT_TOPOLOGY: [(u8, u8, u8); DOTA_TOTAL_PLAYER_SLOTS as usize] = [
     (2, 12, RACE_HUMAN),
 ];
 
+static NEXT_LOCAL_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug, Serialize)]
 struct AgentStatusEvent {
     event: &'static str,
@@ -76,6 +80,10 @@ struct AgentStatusEvent {
     lobby_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nickname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connection_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<&'static str>,
 }
 
 impl AgentStatusEvent {
@@ -85,24 +93,41 @@ impl AgentStatusEvent {
             lobby_count: Some(lobby_count),
             lobby_id: None,
             nickname: None,
+            connection_id: None,
+            outcome: None,
         }
     }
 
-    fn join_request_captured(lobby_id: &str) -> Self {
+    fn join_request_captured(lobby_id: &str, connection_id: u64) -> Self {
         Self {
             event: "join_request_captured",
             lobby_count: None,
             lobby_id: Some(lobby_id.to_owned()),
             nickname: None,
+            connection_id: Some(connection_id),
+            outcome: None,
         }
     }
 
-    fn lobby_joined(lobby_id: &str) -> Self {
+    fn lobby_joined(lobby_id: &str, connection_id: u64) -> Self {
         Self {
             event: "lobby_joined",
             lobby_count: None,
             lobby_id: Some(lobby_id.to_owned()),
             nickname: None,
+            connection_id: Some(connection_id),
+            outcome: None,
+        }
+    }
+
+    fn lobby_session_ended(lobby_id: &str, connection_id: u64, outcome: &'static str) -> Self {
+        Self {
+            event: "lobby_session_ended",
+            lobby_count: None,
+            lobby_id: Some(lobby_id.to_owned()),
+            nickname: None,
+            connection_id: Some(connection_id),
+            outcome: Some(outcome),
         }
     }
 
@@ -112,6 +137,8 @@ impl AgentStatusEvent {
             lobby_count: None,
             lobby_id: None,
             nickname: Some(nickname.to_owned()),
+            connection_id: None,
+            outcome: None,
         }
     }
 }
@@ -297,13 +324,8 @@ async fn main() -> Result<()> {
     let server_url = server_url()?;
     let join_token = join_token()?;
     let catalog = fetch_catalog(&server_url).await?;
-    catalog
-        .validate()
-        .context("server returned an invalid lobby catalog")?;
-
-    if catalog.lobbies.is_empty() {
-        bail!("server returned an empty lobby catalog");
-    }
+    validate_runtime_catalog(&catalog)?;
+    let active_lobbies = catalog.lobbies.clone();
 
     let mut published_lobbies = Vec::with_capacity(catalog.lobbies.len());
     let mut listener_tasks = Vec::with_capacity(catalog.lobbies.len());
@@ -320,7 +342,42 @@ async fn main() -> Result<()> {
         "lobby catalog is published; open Warcraft III > Local Area Network"
     );
     emit_status_event(&AgentStatusEvent::ready(published_lobbies.len()))?;
-    wait_for_shutdown().await?;
+    let mut catalog_refresh_interval = interval_at(
+        Instant::now() + CATALOG_REFRESH_INTERVAL,
+        CATALOG_REFRESH_INTERVAL,
+    );
+    catalog_refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let shutdown = wait_for_shutdown();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            shutdown_result = &mut shutdown => {
+                shutdown_result?;
+                break;
+            }
+            _ = catalog_refresh_interval.tick() => {
+                match fetch_catalog(&server_url).await {
+                    Ok(refreshed_catalog) => match catalog_requires_restart(
+                        &active_lobbies,
+                        &refreshed_catalog,
+                    ) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            info!("lobby catalog changed; restarting agent for a clean republish");
+                            break;
+                        }
+                        Err(error) => {
+                            warn!(%error, "ignored invalid refreshed lobby catalog");
+                        }
+                    },
+                    Err(error) => {
+                        warn!(%error, "could not refresh lobby catalog; keeping current LAN publications");
+                    }
+                }
+            }
+        }
+    }
 
     for task in listener_tasks {
         task.abort();
@@ -329,6 +386,24 @@ async fn main() -> Result<()> {
     info!("local lobby advertisements removed");
 
     Ok(())
+}
+
+fn validate_runtime_catalog(catalog: &LobbyCatalog) -> Result<()> {
+    catalog
+        .validate()
+        .context("server returned an invalid lobby catalog")?;
+    if catalog.lobbies.is_empty() {
+        bail!("server returned an empty lobby catalog");
+    }
+    Ok(())
+}
+
+fn catalog_requires_restart(
+    active_lobbies: &[LobbyDescriptor],
+    refreshed_catalog: &LobbyCatalog,
+) -> Result<bool> {
+    validate_runtime_catalog(refreshed_catalog)?;
+    Ok(active_lobbies != refreshed_catalog.lobbies.as_slice())
 }
 
 async fn fetch_catalog(server_url: &str) -> Result<LobbyCatalog> {
@@ -485,15 +560,41 @@ async fn accept_connections(
             .accept()
             .await
             .with_context(|| format!("listener failed for lobby {}", config.lobby.id))?;
+        let connection_id = next_local_connection_id()?;
         let connection_config = Arc::clone(&config);
         tokio::spawn(async move {
             let lobby_id = connection_config.lobby.id.clone();
-            if let Err(error) =
-                serve_join_connection(connection_config, frame_reader, stream, peer_address).await
-            {
-                warn!(%lobby_id, %error, "W3GS lobby connection ended with an error");
+            let result = serve_join_connection(
+                connection_config,
+                frame_reader,
+                stream,
+                peer_address,
+                connection_id,
+            )
+            .await;
+            let outcome = if result.is_ok() { "closed" } else { "error" };
+
+            if let Err(error) = emit_status_event(&AgentStatusEvent::lobby_session_ended(
+                &lobby_id,
+                connection_id,
+                outcome,
+            )) {
+                warn!(%lobby_id, connection_id, %error, "could not emit lobby session end status");
+            }
+
+            if let Err(error) = result {
+                warn!(%lobby_id, connection_id, %error, "W3GS lobby connection ended with an error");
             }
         });
+    }
+}
+
+fn next_local_connection_id() -> Result<u64> {
+    match NEXT_LOCAL_CONNECTION_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(1)
+    }) {
+        Ok(connection_id) => Ok(connection_id),
+        Err(_) => bail!("local lobby connection ID space is exhausted"),
     }
 }
 
@@ -502,6 +603,7 @@ async fn serve_join_connection(
     frame_reader: FrameReader,
     mut stream: TcpStream,
     peer_address: SocketAddr,
+    connection_id: u64,
 ) -> Result<()> {
     let frame = timeout(JOIN_FRAME_TIMEOUT, frame_reader.read_next(&mut stream))
         .await
@@ -514,6 +616,7 @@ async fn serve_join_connection(
 
     info!(
         %lobby_id,
+        connection_id,
         frame_length = frame.encoded_length(),
         host_counter = request.host_counter(),
         listen_port = request.listen_port(),
@@ -524,7 +627,10 @@ async fn serve_join_connection(
     );
     let player_name = decode_player_name(&request)?;
     emit_status_event(&AgentStatusEvent::nickname_captured(&player_name))?;
-    emit_status_event(&AgentStatusEvent::join_request_captured(lobby_id))?;
+    emit_status_event(&AgentStatusEvent::join_request_captured(
+        lobby_id,
+        connection_id,
+    ))?;
     let remote_session = RemoteLobbySession::connect(
         &config.server_url,
         &config.lobby,
@@ -539,6 +645,7 @@ async fn serve_join_connection(
     write_frames(&mut stream, &initial_frames).await?;
     info!(
         %lobby_id,
+        connection_id,
         assigned_player_id,
         player_count = initial_roster.players.len(),
         "sent coordinated W3GS lobby handshake"
@@ -550,6 +657,7 @@ async fn serve_join_connection(
         remote_session,
         assigned_player_id,
         initial_roster,
+        connection_id,
     )
     .await
 }
@@ -612,6 +720,7 @@ async fn run_lobby_session(
     mut remote_session: RemoteLobbySession,
     assigned_player_id: u8,
     mut roster: LobbyRoster,
+    connection_id: u64,
 ) -> Result<()> {
     let frame_reader =
         FrameReader::new(MAX_LOBBY_FRAME_BYTES).context("invalid lobby W3GS frame limit")?;
@@ -636,7 +745,7 @@ async fn run_lobby_session(
                     return Ok(());
                 };
 
-                if handle_lobby_frame(
+                match handle_lobby_frame(
                     &config,
                     &mut stream,
                     frame,
@@ -647,7 +756,14 @@ async fn run_lobby_session(
                 )
                 .await?
                 {
-                    return Ok(());
+                    LobbyFrameOutcome::Continue => {}
+                    LobbyFrameOutcome::MapReady => {
+                        emit_status_event(&AgentStatusEvent::lobby_joined(
+                            &config.lobby.id,
+                            connection_id,
+                        ))?;
+                    }
+                    LobbyFrameOutcome::SessionEnded => return Ok(()),
                 }
             }
             _ = ping_interval.tick() => {
@@ -924,6 +1040,13 @@ fn player_info(player: &LobbyPlayer) -> Result<Frame> {
     )?)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LobbyFrameOutcome {
+    Continue,
+    MapReady,
+    SessionEnded,
+}
+
 async fn handle_lobby_frame(
     config: &LobbySessionConfig,
     stream: &mut TcpStream,
@@ -932,14 +1055,15 @@ async fn handle_lobby_frame(
     assigned_player_id: u8,
     remote_session: &mut RemoteLobbySession,
     game_started: bool,
-) -> Result<bool> {
+) -> Result<LobbyFrameOutcome> {
+    let mut outcome = LobbyFrameOutcome::Continue;
     match frame.packet_id() {
         MAP_SIZE_PACKET_ID => {
             let became_ready =
                 handle_map_size(config, stream, &frame, map_transfer, assigned_player_id).await?;
             if became_ready {
                 remote_session.mark_ready().await?;
-                emit_status_event(&AgentStatusEvent::lobby_joined(&config.lobby.id))?;
+                outcome = LobbyFrameOutcome::MapReady;
             }
         }
         MAP_PART_OK_PACKET_ID => match MapPartAck::decode(&frame) {
@@ -988,7 +1112,7 @@ async fn handle_lobby_frame(
                 ?reason,
                 "Warcraft requested to leave the lobby"
             );
-            return Ok(true);
+            return Ok(LobbyFrameOutcome::SessionEnded);
         }
         PONG_TO_HOST_PACKET_ID => {
             debug!(lobby_id = %config.lobby.id, "received W3GS lobby pong");
@@ -1056,7 +1180,7 @@ async fn handle_lobby_frame(
         }
     }
 
-    Ok(false)
+    Ok(outcome)
 }
 
 async fn handle_map_size(
@@ -1345,6 +1469,31 @@ mod tests {
 
     static MAP_FLOW_TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+    #[test]
+    fn restarts_only_when_the_validated_lobby_descriptors_change() {
+        let active_catalog = strajer_server::AppState::synthetic_at(2_000, 2)
+            .expect("test catalog should build")
+            .catalog()
+            .clone();
+        let active_lobbies = active_catalog.lobbies.clone();
+        let mut refreshed_catalog = active_catalog.clone();
+        refreshed_catalog.generated_at_unix_ms += 1_000;
+
+        assert!(
+            !catalog_requires_restart(&active_lobbies, &refreshed_catalog)
+                .expect("timestamp-only refresh should validate")
+        );
+
+        refreshed_catalog.lobbies[0].revision += 1;
+        assert!(
+            catalog_requires_restart(&active_lobbies, &refreshed_catalog)
+                .expect("descriptor refresh should validate")
+        );
+
+        refreshed_catalog.lobbies.clear();
+        assert!(catalog_requires_restart(&active_lobbies, &refreshed_catalog).is_err());
+    }
+
     #[tokio::test]
     async fn lobby_listener_accepts_ipv4_and_ipv6_loopback() {
         let listeners = bind_lobby_listeners().expect("loopback lobby listeners should bind");
@@ -1606,13 +1755,28 @@ mod tests {
         let mut output = Vec::new();
         write_status_event(
             &mut output,
-            &AgentStatusEvent::join_request_captured("synthetic-1"),
+            &AgentStatusEvent::join_request_captured("synthetic-1", 41),
         )
         .expect("status should serialize");
 
         assert_eq!(
             String::from_utf8(output).expect("status should be UTF-8"),
-            "{\"event\":\"join_request_captured\",\"lobby_id\":\"synthetic-1\"}\n"
+            "{\"event\":\"join_request_captured\",\"lobby_id\":\"synthetic-1\",\"connection_id\":41}\n"
+        );
+    }
+
+    #[test]
+    fn writes_a_correlated_lobby_session_end_status() {
+        let mut output = Vec::new();
+        write_status_event(
+            &mut output,
+            &AgentStatusEvent::lobby_session_ended("synthetic-1", 41, "error"),
+        )
+        .expect("status should serialize");
+
+        assert_eq!(
+            String::from_utf8(output).expect("status should be UTF-8"),
+            "{\"event\":\"lobby_session_ended\",\"lobby_id\":\"synthetic-1\",\"connection_id\":41,\"outcome\":\"error\"}\n"
         );
     }
 

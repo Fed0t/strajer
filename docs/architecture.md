@@ -44,6 +44,9 @@ pleacă. Chatul lobby este retransmis autoritativ tuturor jucatorilor. La 10/10
 ready countdown-ul porneste automat; pentru testele cu minimum doi jucatori,
 comanda `!start` il porneste imediat sau il armeaza pana cand toate sesiunile
 conectate confirma harta.
+Serverul trimite ping WSS la 15 secunde si elimina o sesiune care nu mai produce
+niciun trafic timp de 45 secunde; cleanup-ul verifica `session_id`, deci un
+disconnect vechi nu poate elimina un slot realocat.
 In loading, serverul inregistreaza idempotent confirmarea fiecarui jucator si o
 propaga numai celorlalte sesiuni, astfel incat agentii sa emita
 `GAMELOADED_OTHERS` fara echo catre jucatorul local.
@@ -59,6 +62,8 @@ pe același port; toate conexiunile către server sunt inițiate outbound.
 Hărțile deja instalate sunt reutilizate numai dacă trec validarea manifestului;
 altfel agentul descarcă asset-ul într-un cache atomic din
 `~/Library/Caches/Strajer/maps` și îl transferă local către Warcraft.
+Agentul trimite ping WSS la 10 secunde si inchide sesiunea locala dupa 35 secunde
+fara activitate de la server, permitand un join nou fara restartul aplicatiei.
 
 ### `Strajer.app`
 
@@ -71,6 +76,8 @@ jocului. Sunt acceptate numai semnaturile cunoscute: cele patru expresii de join
 si cele sapte puncte de precompletare a nickname-ului sunt patch-uite, iar un
 fisier necunoscut nu este suprascris. Endpoint-ul este inclus
 în `Info.plist` la build; utilizatorul nu are configurări.
+Statusurile per join contin un `connection_id`; controllerul ignora evenimentele
+de inchidere apartinand unei conexiuni mai vechi.
 
 ## Fluxul discovery
 

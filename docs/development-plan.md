@@ -95,7 +95,9 @@ Status la 31 august 2026: serverul alocă determinist player ID și slot, iar
 agentul emite `SLOTINFOJOIN`, `PLAYERINFO`, profile/skins Reforged, `MAPCHECK`,
 update de roster și cleanup la leave. Serverul validează harta montată read-only,
 iar agentul implementează download HTTPS autentificat, cache SHA-1/CRC32 și
-transfer W3GS `STARTDOWNLOAD`/`MAPPART`. Codec-urile și pipeline-ul HTTP sunt
+transfer W3GS `STARTDOWNLOAD`/`MAPPART`. Sesiunile au heartbeat bidirectional,
+watchdog de 35 secunde pe agent si 45 secunde pe server, plus cleanup protejat
+de `session_id`. Codec-urile și pipeline-ul HTTP sunt
 validate automat; fluxul a fost validat local în UI numai cu harta deja
 instalată. Testul live pe un Mac fără hartă și validarea pe două Mac-uri rămân
 criterii deschise.
@@ -148,13 +150,18 @@ Criteriu de ieșire:
 - după instalare și acordarea permisiunii Local Network nu există configurare manuală.
 
 Status la 31 august 2026: shell-ul `MenuBarExtra`, agentul inclus, statusul,
-indicatorul `Join request detected` și build-ul universal sunt implementate.
+indicatorul `Join request detected`, statusul `Reconnecting`, backoff-ul
+exponential bounded cu jitter, restartul dupa schimbarea retelei, rotatia
+logului, refresh-ul periodic al catalogului si build-ul universal sunt
+implementate. Evenimentele join/joined/ended sunt corelate prin `connection_id`,
+astfel incat un task vechi nu poate lasa sau sterge o stare falsa in menu bar;
+un esec al sesiunii afiseaza instructiunea de rejoin in Warcraft.
 Aplicatia activeaza automat workaround-ul WebUI offline, derivat si validat din
 instalarea Warcraft locala, fara a redistribui fisierul Blizzard. Nickname-ul se
 salveaza dupa primul join si poate fi schimbat din actiunea `Nickname...` din
 menu bar.
-Launch at login, update-ul semnat, crash reporting, Developer ID și notarizarea
-rămân deschise.
+Launch at login, update-ul semnat, crash reporting, session resume, Developer ID
+și notarizarea rămân deschise.
 
 ## Milestone 5 — Producție Linux
 

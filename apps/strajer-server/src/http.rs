@@ -25,7 +25,7 @@ use strajer_w3gs::{
     OutgoingKeepAlive, PlayerAction,
 };
 use tokio::sync::broadcast;
-use tokio::time::timeout;
+use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
@@ -36,6 +36,8 @@ use crate::lobby::{
 };
 
 const LOBBY_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const LOBBY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const LOBBY_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_LOBBY_WEBSOCKET_MESSAGE_BYTES: usize =
     if MAX_LOBBY_CONTROL_MESSAGE_BYTES > MAX_GAME_TUNNEL_MESSAGE_BYTES {
         MAX_LOBBY_CONTROL_MESSAGE_BYTES
@@ -190,19 +192,19 @@ async fn serve_lobby_socket(mut socket: WebSocket, room: Arc<LobbyRoom>, lobby_i
 
     let player_id = membership.player_id;
     let session_id = membership.session_id;
-    info!(%lobby_id, player_id, "player joined coordinated lobby");
+    info!(%lobby_id, player_id, session_id, "player joined coordinated lobby");
 
     if let Err(error) = run_connected_lobby_socket(&mut socket, &room, membership).await {
-        warn!(%lobby_id, player_id, %error, "coordinated lobby socket ended with an error");
+        warn!(%lobby_id, player_id, session_id, %error, "coordinated lobby socket ended with an error");
     }
 
     if let Err(error) = room
         .leave(player_id, session_id, LobbyLeaveReason::Disconnect)
         .await
     {
-        warn!(%lobby_id, player_id, %error, "could not clean up coordinated lobby membership");
+        warn!(%lobby_id, player_id, session_id, %error, "could not clean up coordinated lobby membership");
     }
-    info!(%lobby_id, player_id, "player left coordinated lobby");
+    info!(%lobby_id, player_id, session_id, "player left coordinated lobby");
 }
 
 async fn receive_join_message(
@@ -242,16 +244,30 @@ async fn run_connected_lobby_socket(
     )
     .await?;
 
+    let connected_at = Instant::now();
+    let mut last_client_activity = connected_at;
+    let mut heartbeat_interval = interval_at(
+        connected_at + LOBBY_HEARTBEAT_INTERVAL,
+        LOBBY_HEARTBEAT_INTERVAL,
+    );
+    heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             received = socket.recv() => {
-                match received {
-                    Some(Ok(Message::Ping(payload))) => {
+                let Some(message) = received else {
+                    return Ok(());
+                };
+                let message = message.context("could not read lobby WebSocket")?;
+                last_client_activity = Instant::now();
+
+                match message {
+                    Message::Ping(payload) => {
                         socket.send(Message::Pong(payload)).await.context("could not send WebSocket pong")?;
                     }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) | None => return Ok(()),
-                    Some(Ok(Message::Text(text))) => {
+                    Message::Pong(_) => {}
+                    Message::Close(_) => return Ok(()),
+                    Message::Text(text) => {
                         if let Some(response) = handle_active_agent_message(
                             room,
                             membership.player_id,
@@ -262,7 +278,7 @@ async fn run_connected_lobby_socket(
                             send_server_message(socket, &response).await?;
                         }
                     }
-                    Some(Ok(Message::Binary(payload))) => {
+                    Message::Binary(payload) => {
                         handle_active_agent_game_message(
                             room,
                             membership.player_id,
@@ -271,8 +287,24 @@ async fn run_connected_lobby_socket(
                         )
                         .await?;
                     }
-                    Some(Err(error)) => return Err(error).context("could not read lobby WebSocket"),
                 }
+            }
+            _ = heartbeat_interval.tick() => {
+                let now = Instant::now();
+                if lobby_client_idle_timed_out(
+                    last_client_activity,
+                    now,
+                    LOBBY_CLIENT_IDLE_TIMEOUT,
+                ) {
+                    bail!(
+                        "lobby client heartbeat timed out after {} seconds",
+                        LOBBY_CLIENT_IDLE_TIMEOUT.as_secs()
+                    );
+                }
+                socket
+                    .send(Message::Ping(Vec::new().into()))
+                    .await
+                    .context("could not send lobby WebSocket heartbeat")?;
             }
             update = membership.updates.recv() => {
                 let message = match update {
@@ -286,15 +318,10 @@ async fn run_connected_lobby_socket(
                     Ok(LobbyUpdate::Chat {
                         from_player_id,
                         message,
-                    }) => {
-                        if from_player_id == membership.player_id {
-                            continue;
-                        }
-                        Some(ServerLobbyMessage::Chat {
-                            from_player_id,
-                            message,
-                        })
-                    }
+                    }) => Some(ServerLobbyMessage::Chat {
+                        from_player_id,
+                        message,
+                    }),
                     Ok(LobbyUpdate::Start) => Some(ServerLobbyMessage::Start),
                     Ok(LobbyUpdate::PlayerLoaded { player_id }) => {
                         Some(ServerLobbyMessage::PlayerLoaded { player_id })
@@ -333,6 +360,14 @@ async fn run_connected_lobby_socket(
             }
         }
     }
+}
+
+fn lobby_client_idle_timed_out(
+    last_client_activity: Instant,
+    now: Instant,
+    idle_timeout: Duration,
+) -> bool {
+    now.saturating_duration_since(last_client_activity) >= idle_timeout
 }
 
 async fn send_lobby_control_snapshot(socket: &mut WebSocket, room: &LobbyRoom) -> Result<()> {
@@ -546,6 +581,23 @@ mod tests {
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     static TEST_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+    #[test]
+    fn detects_lobby_client_idle_timeout_at_the_exact_deadline() {
+        let last_activity = Instant::now();
+        let idle_timeout = Duration::from_secs(45);
+
+        assert!(!lobby_client_idle_timed_out(
+            last_activity,
+            last_activity + idle_timeout - Duration::from_millis(1),
+            idle_timeout,
+        ));
+        assert!(lobby_client_idle_timed_out(
+            last_activity,
+            last_activity + idle_timeout,
+            idle_timeout,
+        ));
+    }
+
     #[tokio::test]
     async fn serves_a_valid_synthetic_catalog() {
         let state = AppState::synthetic_at(2_000, 2).expect("state should be valid");
@@ -739,7 +791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relays_lobby_chat_without_echo_and_accepts_manual_start() {
+    async fn relays_lobby_chat_once_to_every_player_and_accepts_manual_start() {
         let (endpoint, server_task) = start_websocket_server().await;
         let mut first = connect_lobby_client(&endpoint, "First#1000").await;
         receive_joined(&mut first).await;
@@ -754,10 +806,22 @@ mod tests {
         )
         .await;
         assert_eq!(
+            receive_chat(&mut first).await,
+            (1, "hello second player".to_owned())
+        );
+        assert_eq!(
             receive_chat(&mut second).await,
             (1, "hello second player".to_owned())
         );
+
+        send_agent_control(
+            &mut first,
+            AgentLobbyMessage::chat("hello second player".to_owned())
+                .expect("duplicate chat should be valid"),
+        )
+        .await;
         assert_no_control_message(&mut first).await;
+        assert_no_control_message(&mut second).await;
 
         send_agent_control(
             &mut first,
@@ -904,7 +968,7 @@ mod tests {
             timeout(Duration::from_millis(100), socket.next())
                 .await
                 .is_err(),
-            "chat sender must not receive a server echo"
+            "duplicate chat must not produce another control message"
         );
     }
 

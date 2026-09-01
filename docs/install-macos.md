@@ -50,9 +50,15 @@ shasum -a 256 -c Strajer-0.1.0-macos-universal.zip.sha256
 10. Ambii jucători aleg `Strajer Test #1`; după join trebuie să apară `3/11`:
     cele doua nume umane plus `Strajer` in slotul `HOSTBOT`.
 11. Mesajele scrise in chat trebuie sa apara pe ambele Mac-uri cu nickname-ul
-    expeditorului. Pentru testul cu doua Mac-uri, scrie `!start`; countdown-ul de
+    expeditorului, exact o data inclusiv pe Mac-ul expeditorului. Pentru testul
+    cu doua Mac-uri, scrie `!start`; countdown-ul de
     60 secunde porneste cand ambii jucatori au harta verificata. Daca unul inca
     descarca harta, comanda ramane armata pana cand devine ready.
+
+Daca sesiunea WSS cade, menu bar-ul sterge starea `Lobby joined` si afiseaza
+`Lobby disconnected; rejoin in Warcraft`. Nu este necesar restartul Strajer:
+revino in lista LAN si intra din nou. Resume transparent in mijlocul partidei nu
+este inca suportat.
 
 Strajer activeaza automat preferinta Warcraft `Allow Local Files`. Bundle-ul nu
 contine si nu redistribuie fisiere Blizzard: patch-ul este derivat din versiunea

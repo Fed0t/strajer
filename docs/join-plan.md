@@ -53,9 +53,11 @@ live de 15 minute pe doua Mac-uri.
   `REQJOIN`, serverul a alocat player ID `2`, iar roster-ul a ajuns la doi
   jucători.
 - Proxy-ul public inchidea WSS dupa aproximativ 90 de secunde fara trafic.
-  Agentul trimite acum heartbeat WebSocket la 30 de secunde; acelasi lobby a
-  ramas activ peste 128 de secunde in testul public, fara reconnect sau eroare
-  WSS.
+  Agentul trimite heartbeat WebSocket la 10 secunde, iar serverul la 15 secunde.
+  Watchdog-ul agentului inchide sesiunea dupa 35 secunde fara trafic server-side,
+  iar watchdog-ul serverului elibereaza slotul dupa 45 secunde fara trafic de la
+  client. Testul public anterior a mentinut lobby-ul peste 128 de secunde; noile
+  deadline-uri sunt acoperite automat si asteapta revalidarea live.
 
 Join-ul simultan pe doua Mac-uri este validat. Urmatorul deploy trebuie sa
 actualizeze coordonat serverul la catalog schema `3` / session protocol `5` si
@@ -240,8 +242,10 @@ Ordinea de implementare pentru primul lobby real:
 8. adaugă team/color, countdown, loading synchronization și action loop;
 9. adaugă leave, lag handling, desync detection și replay.
 
-Pasul 8 si partea de leave/desync/cleanup din pasul 9 sunt implementate. Replay,
-reconnect si validarea live sub lag raman deschise.
+Pasul 8 si partea de leave/desync/cleanup din pasul 9 sunt implementate.
+Detectia half-open si rejoin-ul fara restart Strajer sunt implementate;
+transparent session resume in gameplay, replay-ul si validarea live sub lag
+raman deschise.
 
 Map transfer-ul este implementat ca extensie izolată peste join-ul existent:
 manifestul și cache-ul sunt separate de codec-ul W3GS, iar lipsa hărții nu mai
